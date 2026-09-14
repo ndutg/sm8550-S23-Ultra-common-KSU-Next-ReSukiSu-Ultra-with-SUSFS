@@ -1,233 +1,205 @@
-name: "[INSPECT] 70_ksu_safety — dump raw facts"
-
 # ══════════════════════════════════════════════════════════════════
-#  PURE DIAGNOSTIC. Builds nothing. ~3 minutes.
+#  70_ksu_safety — NATIVE PORT for ReSukiSU v4.2.0-rc2
 #
-#  Exists because:
-#    - GitHub's web renderer elides the middle of the 70_ patch, so
-#      the visible text is incomplete and would not compile.
-#    - Claude's sandbox has no outbound network (curl -> HTTP 403),
-#      so the file cannot be fetched directly.
-#    - The CI runner CAN reach both repos.
+#  Replaces the 70_ block inside the "Apply patch stack and measure"
+#  step of build-kernel-exp4.yml. Indentation: 10 spaces, already set.
 #
-#  Applies 50_ and 51_ first (51_ is what would introduce the
-#  KSTAT_REDIRECT command), then dumps ground truth:
+#  ── WHY THE ORIGINAL PATCH CANNOT BE USED AS-IS ──────────────────
 #
-#    A. The complete 70_ patch, byte-for-byte
-#    B. ReSukiSU's supercall/ layout after the rc2 refactor
-#    C. Which file now holds the command dispatcher
-#    D. Whether CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT exists at all
-#    E. Whether CONFIG_KSU_SUSFS_SUS_KSTAT_REDIRECT is in any Kconfig
-#    F. The dispatcher's real surrounding code
-#    G. What 51_ actually adds re: REDIRECT
+#  The inspector run established three facts:
 #
-#  Isolation: workflow_dispatch only, no schedule, no caches,
-#  no artifacts, read-only permissions.
+#  1. The dispatcher MOVED:
+#       kernel/supercalls.c  ->  kernel/supercall/dispatch.c  (1434 lines)
+#
+#  2. The dispatcher was REWRITTEN from an if-chain to a switch:
+#       patch expects:   if (cmd == CMD_X) { ... }
+#       rc2 actually has: case CMD_X: { ... }
+#     So even a corrected path would still reject — the body is the
+#     wrong C construct.
+#
+#  3. Hunk 1 of the patch is IRRELEVANT here:
+#       -#ifdef KSU_TP_HOOK
+#       +#if defined(KSU_TP_HOOK) && defined(CONFIG_KSU_SUSFS)
+#     It guards ksu_mark_running_process() for builds WITHOUT SUSFS.
+#     We always enable CONFIG_KSU_SUSFS, so it is a no-op for us.
+#     Only hunk 2 carries real functionality.
+#
+#  ── WHAT THIS DOES INSTEAD ───────────────────────────────────────
+#  Inserts hunk 2's logic in rc2's native switch-case form, anchored
+#  on the exact line that terminates the KSTAT block:
+#       #endif //#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+#
+#  Every precondition is verified before touching anything, and the
+#  result is syntax-checked afterwards. Non-fatal throughout.
+#
+#  ── CORRECTION TO EARLIER ADVICE ─────────────────────────────────
+#  I previously suggested injecting CONFIG_KSU_SUSFS_SUS_KSTAT_REDIRECT
+#  into drivers/kernelsu/Kconfig. That was WRONG and is NOT done here.
+#  51_enhanced already declares it in fs/Kconfig (51_ line 9). My
+#  earlier grep only checked drivers/kernelsu/Kconfig, producing a
+#  false negative. No Kconfig changes are needed.
 # ══════════════════════════════════════════════════════════════════
 
-on:
-  workflow_dispatch:
-    inputs:
-      apply_50_51:
-        description: "Apply 50_ and 51_ before inspecting (recommended)"
-        type: boolean
-        default: true
-
-permissions:
-  contents: read
-
-env:
-  ANDROID_VER: android13-5.15
-  SB_REPO: https://github.com/Enginex0/Super-Builders.git
-  SB_COMMIT: c2cb71614868fe742cbffee2b6f3126523432673
-  RESUKISU_SETUP: https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
-jobs:
-  inspect:
-    name: Dump 70_ facts
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-
-    steps:
-
-      - name: Checkout kernel source
-        uses: actions/checkout@v4
-        with:
-          repository: yucca-a/kernel_samsung_sm8550
-          ref: main
-          fetch-depth: 1
-
-      - name: Setup ReSukiSU
-        run: |
-          curl -sSfL --retry 3 "${{ env.RESUKISU_SETUP }}" | bash -s main \
-            || { echo "setup.sh failed"; exit 1; }
-          echo "ReSukiSU: $(git -C KernelSU describe --tags --abbrev=0 2>/dev/null || echo main) @ $(git -C KernelSU rev-parse --short HEAD)"
-
-      - name: Fetch Super-Builders
-        run: |
-          git clone --quiet "${{ env.SB_REPO }}" sb-src
-          git -C sb-src checkout --quiet "${{ env.SB_COMMIT }}"
-          echo "SB_DIR=sb-src/${{ env.ANDROID_VER }}/ReSukiSU/patches" >> $GITHUB_ENV
-
-      - name: Apply 50_ and 51_
-        if: inputs.apply_50_51
-        run: |
-          P50="${SB_DIR}/50_add_susfs_in_gki-${{ env.ANDROID_VER }}.patch"
-          P51="$(find "$SB_DIR" -maxdepth 1 -name '51_*.patch' | head -1)"
-          echo "==> applying 50_"
-          patch -p1 --batch --forward --fuzz=3 < "$P50" >/dev/null 2>&1 || true
-          echo "==> applying 51_"
-          [ -n "$P51" ] && { patch -p1 --batch --forward --fuzz=3 < "$P51" >/dev/null 2>&1 || true; }
-          echo "==> done"
-
-      # ══════════════════════════════════════════════════════════
-      #  A. THE COMPLETE PATCH
-      # ══════════════════════════════════════════════════════════
-      - name: "A — full 70_ patch, byte-for-byte"
-        run: |
-          P70="$(find "$SB_DIR" -maxdepth 1 -name '70_*.patch' | head -1)"
-          echo "=================================================="
-          echo "  A. FULL 70_ PATCH"
-          echo "=================================================="
-          echo "File : $P70"
-          echo "Size : $(wc -c < "$P70") bytes"
-          echo "Lines: $(wc -l < "$P70")"
-          echo "SHA  : $(sha256sum "$P70" | cut -d' ' -f1)"
-          echo ""
-          echo "---------- BEGIN (cat -A: \$=EOL, ^I=tab) ----------"
-          cat -A "$P70"
-          echo "---------- END ----------"
-          echo ""
-          echo "---------- PLAIN, NUMBERED ----------"
-          cat -n "$P70"
-          echo "---------- END ----------"
-
-      # ══════════════════════════════════════════════════════════
-      #  B. SUPERCALL LAYOUT AFTER rc2 REFACTOR
-      # ══════════════════════════════════════════════════════════
-      - name: "B — KernelSU/kernel layout"
-        run: |
-          echo "=================================================="
-          echo "  B. RESUKISU KERNEL LAYOUT"
-          echo "=================================================="
-          echo "--- KernelSU/kernel/ ---"
-          ls -la KernelSU/kernel/ | sed 's/^/  /'
-          echo ""
-          echo "--- KernelSU/kernel/supercall/ ---"
-          ls -la KernelSU/kernel/supercall/ 2>/dev/null | sed 's/^/  /' \
-            || echo "  (no supercall/ directory)"
-          echo ""
-          echo "--- any file named *supercall* ---"
-          find KernelSU -iname '*supercall*' | sed 's/^/  /' || echo "  (none)"
-
-      # ══════════════════════════════════════════════════════════
-      #  C. WHERE IS THE DISPATCHER NOW?
-      # ══════════════════════════════════════════════════════════
-      - name: "C — locate command dispatcher"
-        run: |
-          echo "=================================================="
-          echo "  C. DISPATCHER LOCATION"
-          echo "=================================================="
-          echo "--- files containing CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY ---"
-          grep -rln 'CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY' KernelSU/ 2>/dev/null | sed 's/^/  /' \
-            || echo "  (none)"
-          echo ""
-          echo "--- files containing CMD_SUSFS_SET_UNAME (patch context) ---"
-          grep -rln 'CMD_SUSFS_SET_UNAME' KernelSU/ 2>/dev/null | sed 's/^/  /' \
-            || echo "  (none)"
-          echo ""
-          echo "--- all .c files mentioning CMD_SUSFS ---"
-          grep -rln 'CMD_SUSFS' KernelSU/ 2>/dev/null | grep '\.c$' | sed 's/^/  /' \
-            || echo "  (none)"
-
-      # ══════════════════════════════════════════════════════════
-      #  D. DOES THE REDIRECT COMMAND EXIST?
-      # ══════════════════════════════════════════════════════════
-      - name: "D — CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT"
-        run: |
-          echo "=================================================="
-          echo "  D. KSTAT_REDIRECT COMMAND"
-          echo "=================================================="
-          echo "--- every occurrence, whole tree ---"
-          grep -rn 'CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT' \
-            include/ fs/ KernelSU/ 2>/dev/null | head -30 | sed 's/^/  /' \
-            || echo "  ❌ NOT FOUND ANYWHERE"
-          echo ""
-          echo "--- all CMD_SUSFS_* definitions in susfs_def.h ---"
-          grep -n 'define CMD_SUSFS' include/linux/susfs_def.h 2>/dev/null | sed 's/^/  /' \
-            || echo "  (susfs_def.h absent or no defines)"
-
-      # ══════════════════════════════════════════════════════════
-      #  E. KCONFIG GUARD SYMBOL
-      # ══════════════════════════════════════════════════════════
-      - name: "E — Kconfig guard"
-        run: |
-          echo "=================================================="
-          echo "  E. CONFIG_KSU_SUSFS_SUS_KSTAT_REDIRECT"
-          echo "=================================================="
-          echo "--- in any Kconfig ---"
-          grep -rn 'KSU_SUSFS_SUS_KSTAT_REDIRECT' \
-            drivers/kernelsu/Kconfig KernelSU/kernel/Kconfig 2>/dev/null | sed 's/^/  /' \
-            || echo "  ❌ NOT DECLARED"
-          echo ""
-          echo "--- all KSTAT-related Kconfig entries ---"
-          grep -rn 'KSTAT' drivers/kernelsu/Kconfig 2>/dev/null | sed 's/^/  /' \
-            || echo "  (none)"
-          echo ""
-          echo "--- full SUSFS Kconfig block (for dependency style) ---"
-          grep -A3 '^config KSU_SUSFS' drivers/kernelsu/Kconfig 2>/dev/null \
-            | head -60 | sed 's/^/  /' || echo "  (none)"
-
-      # ══════════════════════════════════════════════════════════
-      #  F. REAL DISPATCHER CODE AROUND THE PATCH TARGET
-      # ══════════════════════════════════════════════════════════
-      - name: "F — dispatcher source context"
-        run: |
-          echo "=================================================="
-          echo "  F. DISPATCHER SOURCE"
-          echo "=================================================="
-          D="$(grep -rl 'CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY' KernelSU/ 2>/dev/null | grep '\.c$' | head -1)"
-          if [ -z "$D" ]; then
-            echo "  (dispatcher not found — nothing to show)"
-          else
-            echo "File: $D"
-            echo "Total lines: $(wc -l < "$D")"
+          # ══ NATIVE 70_ PORT ══════════════════════════════════════
+          if [ "${{ inputs.apply_70 }}" = "true" ]; then
             echo ""
-            echo "--- KSTAT / UNAME command region ---"
-            grep -n 'CMD_SUSFS' "$D" | sed 's/^/  /'
-            echo ""
-            echo "--- ±25 lines around KSTAT_STATICALLY ---"
-            LN="$(grep -n 'CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY' "$D" | head -1 | cut -d: -f1)"
-            if [ -n "$LN" ]; then
-              S=$(( LN > 25 ? LN - 25 : 1 ))
-              E=$(( LN + 25 ))
-              sed -n "${S},${E}p" "$D" | cat -n | sed "s/^/  /"
+            echo "────────────────────────────────────────────────"
+            echo "  NATIVE PORT: 70_ksu_safety (hunk 2)"
+            echo "────────────────────────────────────────────────"
+
+            DISPATCH="${ROOT}/KernelSU/kernel/supercall/dispatch.c"
+            PORT_OK=1
+
+            # ── Precondition 1: dispatcher exists ──
+            if [ ! -f "$DISPATCH" ]; then
+              echo "  ❌ dispatch.c not found at expected path"
+              echo "     searching..."
+              DISPATCH="$(grep -rl 'CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY' \
+                            "${ROOT}/KernelSU/kernel/" 2>/dev/null \
+                          | grep '\.c$' | head -1 || true)"
+              if [ -z "$DISPATCH" ]; then
+                echo "     ❌ not found anywhere — aborting port"
+                echo "70_native:X:no-dispatcher" >> /tmp/fuzz_summary
+                PORT_OK=0
+              else
+                echo "     ✅ relocated: $DISPATCH"
+              fi
+            else
+              echo "  ✅ dispatcher: kernel/supercall/dispatch.c"
             fi
+
+            # ── Precondition 2: command constant defined (from 51_) ──
+            if [ "$PORT_OK" = "1" ]; then
+              if grep -q 'define CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT' \
+                   "${ROOT}/include/linux/susfs_def.h" 2>/dev/null; then
+                echo "  ✅ CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT defined:"
+                grep -n 'define CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT' \
+                  "${ROOT}/include/linux/susfs_def.h" | sed 's/^/       /'
+              else
+                echo "  ❌ command constant missing — 51_ did not apply?"
+                echo "70_native:X:cmd-undefined" >> /tmp/fuzz_summary
+                PORT_OK=0
+              fi
+            fi
+
+            # ── Precondition 3: implementation function exists ──
+            # Without this the insertion causes an implicit-declaration
+            # error, or worse an undefined symbol at link time.
+            if [ "$PORT_OK" = "1" ]; then
+              if grep -rq 'susfs_add_sus_kstat_redirect' \
+                   "${ROOT}/include/linux/susfs.h" "${ROOT}/fs/susfs.c" 2>/dev/null; then
+                echo "  ✅ susfs_add_sus_kstat_redirect() present:"
+                grep -rn 'susfs_add_sus_kstat_redirect' \
+                  "${ROOT}/include/linux/susfs.h" "${ROOT}/fs/susfs.c" 2>/dev/null \
+                  | head -4 | sed 's/^/       /'
+              else
+                echo "  ❌ susfs_add_sus_kstat_redirect() NOT found."
+                echo "     Inserting the case would break the build."
+                echo "70_native:X:impl-missing" >> /tmp/fuzz_summary
+                PORT_OK=0
+              fi
+            fi
+
+            # ── Precondition 4: Kconfig symbol declared (by 51_) ──
+            if [ "$PORT_OK" = "1" ]; then
+              if grep -rq 'KSU_SUSFS_SUS_KSTAT_REDIRECT' \
+                   "${ROOT}/fs/Kconfig" "${ROOT}/drivers/kernelsu/Kconfig" 2>/dev/null; then
+                echo "  ✅ CONFIG_KSU_SUSFS_SUS_KSTAT_REDIRECT declared:"
+                grep -rn 'KSU_SUSFS_SUS_KSTAT_REDIRECT' \
+                  "${ROOT}/fs/Kconfig" "${ROOT}/drivers/kernelsu/Kconfig" 2>/dev/null \
+                  | head -3 | sed 's/^/       /'
+              else
+                echo "  ⚠️  Kconfig symbol not declared — case will be"
+                echo "     #ifdef'd out. Harmless, but inert."
+              fi
+            fi
+
+            # ── Precondition 5: not already present ──
+            if [ "$PORT_OK" = "1" ]; then
+              if grep -q 'CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT' "$DISPATCH"; then
+                echo "  ℹ️  already handled in dispatcher — nothing to do"
+                echo "70_native:0:already-present" >> /tmp/fuzz_summary
+                echo "KSU_SAFETY_OK=1" >> $GITHUB_ENV
+                PORT_OK=0
+              fi
+            fi
+
+            # ── Precondition 6: anchor line exists, exactly once ──
+            if [ "$PORT_OK" = "1" ]; then
+              ANCHOR_N="$(grep -c '^#endif //#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT$' "$DISPATCH" || echo 0)"
+              echo "  Anchor '#endif //#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT' found: ${ANCHOR_N}x"
+              if [ "$ANCHOR_N" != "1" ]; then
+                echo "  ❌ expected exactly 1 anchor — aborting"
+                echo "70_native:X:bad-anchor" >> /tmp/fuzz_summary
+                PORT_OK=0
+              fi
+            fi
+
+            # ── Apply: insert in rc2's native switch-case form ──
+            if [ "$PORT_OK" = "1" ]; then
+              echo ""
+              echo "  --- BEFORE ---"
+              grep -n -B6 '^#endif //#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT$' "$DISPATCH" | sed 's/^/    /'
+
+              cp "$DISPATCH" /tmp/dispatch.c.bak
+
+              awk '
+                /^#endif \/\/#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT$/ && !done {
+                    print "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT_REDIRECT"
+                    print "    case CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT: {"
+                    print "        susfs_add_sus_kstat_redirect(arg);"
+                    print "        return 0;"
+                    print "    }"
+                    print "#endif"
+                    done = 1
+                }
+                { print }
+              ' /tmp/dispatch.c.bak > "$DISPATCH"
+
+              echo ""
+              echo "  --- AFTER ---"
+              grep -n -B10 -A2 '^#endif //#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT$' "$DISPATCH" | sed 's/^/    /'
+
+              # ── Verify ──
+              echo ""
+              echo "  --- VERIFICATION ---"
+              VOK=1
+              N="$(grep -c 'CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT' "$DISPATCH" || echo 0)"
+              [ "$N" = "1" ] && echo "    ✅ case inserted exactly once" \
+                             || { echo "    ❌ inserted ${N}x (expected 1)"; VOK=0; }
+
+              OB="$(grep -c '{' /tmp/dispatch.c.bak || echo 0)"
+              CB="$(grep -c '}' /tmp/dispatch.c.bak || echo 0)"
+              OA="$(grep -c '{' "$DISPATCH" || echo 0)"
+              CA="$(grep -c '}' "$DISPATCH" || echo 0)"
+              echo "    braces: before ${OB}/${CB}  after ${OA}/${CA}"
+              [ "$(( OA - OB ))" = "1" ] && [ "$(( CA - CB ))" = "1" ] \
+                && echo "    ✅ brace delta balanced (+1/+1)" \
+                || { echo "    ❌ brace delta unbalanced"; VOK=0; }
+
+              LB="$(wc -l < /tmp/dispatch.c.bak)"
+              LA="$(wc -l < "$DISPATCH")"
+              echo "    lines: ${LB} -> ${LA} (+$(( LA - LB )))"
+              [ "$(( LA - LB ))" = "6" ] || { echo "    ❌ expected +6 lines"; VOK=0; }
+
+              if [ "$VOK" = "1" ]; then
+                echo ""
+                echo "  ✅ NATIVE PORT SUCCESSFUL"
+                echo "70_native:0:ported" >> /tmp/fuzz_summary
+                echo "KSU_SAFETY_OK=1" >> $GITHUB_ENV
+              else
+                echo ""
+                echo "  ❌ verification failed — REVERTING"
+                cp /tmp/dispatch.c.bak "$DISPATCH"
+                echo "70_native:X:verify-failed" >> /tmp/fuzz_summary
+                echo "::warning::70_ native port reverted; build continues without it"
+              fi
+            fi
+
+            # Note on hunk 1 (deliberately not ported)
+            echo ""
+            echo "  NOTE: hunk 1 (KSU_TP_HOOK guard) intentionally skipped."
+            echo "        It only matters when CONFIG_KSU_SUSFS is DISABLED."
+            echo "        We always enable it, so it is a no-op here."
           fi
-
-      # ══════════════════════════════════════════════════════════
-      #  G. WHAT DOES 51_ ADD ABOUT REDIRECT?
-      # ══════════════════════════════════════════════════════════
-      - name: "G — 51_ patch: REDIRECT references"
-        run: |
-          echo "=================================================="
-          echo "  G. 51_enhanced vs KSTAT_REDIRECT"
-          echo "=================================================="
-          P51="$(find "$SB_DIR" -maxdepth 1 -name '51_*.patch' | head -1)"
-          echo "File: $P51"
-          echo ""
-          echo "--- lines mentioning REDIRECT ---"
-          grep -n 'REDIRECT' "$P51" 2>/dev/null | head -40 | sed 's/^/  /' \
-            || echo "  ❌ 51_ does not mention REDIRECT at all"
-          echo ""
-          echo "--- lines mentioning KSTAT ---"
-          grep -cn 'KSTAT' "$P51" 2>/dev/null | sed 's/^/  KSTAT mentions: /' || true
-
-      - name: "SUMMARY"
-        if: always()
-        run: |
-          echo "=================================================="
-          echo "  Inspection complete."
-          echo "  Paste sections A-G back to Claude."
-          echo "=================================================="
+          # ══ END NATIVE 70_ PORT ══════════════════════════════════
