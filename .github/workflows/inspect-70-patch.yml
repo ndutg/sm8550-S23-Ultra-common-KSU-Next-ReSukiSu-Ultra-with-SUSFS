@@ -1,0 +1,233 @@
+name: "[INSPECT] 70_ksu_safety — dump raw facts"
+
+# ══════════════════════════════════════════════════════════════════
+#  PURE DIAGNOSTIC. Builds nothing. ~3 minutes.
+#
+#  Exists because:
+#    - GitHub's web renderer elides the middle of the 70_ patch, so
+#      the visible text is incomplete and would not compile.
+#    - Claude's sandbox has no outbound network (curl -> HTTP 403),
+#      so the file cannot be fetched directly.
+#    - The CI runner CAN reach both repos.
+#
+#  Applies 50_ and 51_ first (51_ is what would introduce the
+#  KSTAT_REDIRECT command), then dumps ground truth:
+#
+#    A. The complete 70_ patch, byte-for-byte
+#    B. ReSukiSU's supercall/ layout after the rc2 refactor
+#    C. Which file now holds the command dispatcher
+#    D. Whether CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT exists at all
+#    E. Whether CONFIG_KSU_SUSFS_SUS_KSTAT_REDIRECT is in any Kconfig
+#    F. The dispatcher's real surrounding code
+#    G. What 51_ actually adds re: REDIRECT
+#
+#  Isolation: workflow_dispatch only, no schedule, no caches,
+#  no artifacts, read-only permissions.
+# ══════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_50_51:
+        description: "Apply 50_ and 51_ before inspecting (recommended)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  ANDROID_VER: android13-5.15
+  SB_REPO: https://github.com/Enginex0/Super-Builders.git
+  SB_COMMIT: c2cb71614868fe742cbffee2b6f3126523432673
+  RESUKISU_SETUP: https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  inspect:
+    name: Dump 70_ facts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: yucca-a/kernel_samsung_sm8550
+          ref: main
+          fetch-depth: 1
+
+      - name: Setup ReSukiSU
+        run: |
+          curl -sSfL --retry 3 "${{ env.RESUKISU_SETUP }}" | bash -s main \
+            || { echo "setup.sh failed"; exit 1; }
+          echo "ReSukiSU: $(git -C KernelSU describe --tags --abbrev=0 2>/dev/null || echo main) @ $(git -C KernelSU rev-parse --short HEAD)"
+
+      - name: Fetch Super-Builders
+        run: |
+          git clone --quiet "${{ env.SB_REPO }}" sb-src
+          git -C sb-src checkout --quiet "${{ env.SB_COMMIT }}"
+          echo "SB_DIR=sb-src/${{ env.ANDROID_VER }}/ReSukiSU/patches" >> $GITHUB_ENV
+
+      - name: Apply 50_ and 51_
+        if: inputs.apply_50_51
+        run: |
+          P50="${SB_DIR}/50_add_susfs_in_gki-${{ env.ANDROID_VER }}.patch"
+          P51="$(find "$SB_DIR" -maxdepth 1 -name '51_*.patch' | head -1)"
+          echo "==> applying 50_"
+          patch -p1 --batch --forward --fuzz=3 < "$P50" >/dev/null 2>&1 || true
+          echo "==> applying 51_"
+          [ -n "$P51" ] && { patch -p1 --batch --forward --fuzz=3 < "$P51" >/dev/null 2>&1 || true; }
+          echo "==> done"
+
+      # ══════════════════════════════════════════════════════════
+      #  A. THE COMPLETE PATCH
+      # ══════════════════════════════════════════════════════════
+      - name: "A — full 70_ patch, byte-for-byte"
+        run: |
+          P70="$(find "$SB_DIR" -maxdepth 1 -name '70_*.patch' | head -1)"
+          echo "=================================================="
+          echo "  A. FULL 70_ PATCH"
+          echo "=================================================="
+          echo "File : $P70"
+          echo "Size : $(wc -c < "$P70") bytes"
+          echo "Lines: $(wc -l < "$P70")"
+          echo "SHA  : $(sha256sum "$P70" | cut -d' ' -f1)"
+          echo ""
+          echo "---------- BEGIN (cat -A: \$=EOL, ^I=tab) ----------"
+          cat -A "$P70"
+          echo "---------- END ----------"
+          echo ""
+          echo "---------- PLAIN, NUMBERED ----------"
+          cat -n "$P70"
+          echo "---------- END ----------"
+
+      # ══════════════════════════════════════════════════════════
+      #  B. SUPERCALL LAYOUT AFTER rc2 REFACTOR
+      # ══════════════════════════════════════════════════════════
+      - name: "B — KernelSU/kernel layout"
+        run: |
+          echo "=================================================="
+          echo "  B. RESUKISU KERNEL LAYOUT"
+          echo "=================================================="
+          echo "--- KernelSU/kernel/ ---"
+          ls -la KernelSU/kernel/ | sed 's/^/  /'
+          echo ""
+          echo "--- KernelSU/kernel/supercall/ ---"
+          ls -la KernelSU/kernel/supercall/ 2>/dev/null | sed 's/^/  /' \
+            || echo "  (no supercall/ directory)"
+          echo ""
+          echo "--- any file named *supercall* ---"
+          find KernelSU -iname '*supercall*' | sed 's/^/  /' || echo "  (none)"
+
+      # ══════════════════════════════════════════════════════════
+      #  C. WHERE IS THE DISPATCHER NOW?
+      # ══════════════════════════════════════════════════════════
+      - name: "C — locate command dispatcher"
+        run: |
+          echo "=================================================="
+          echo "  C. DISPATCHER LOCATION"
+          echo "=================================================="
+          echo "--- files containing CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY ---"
+          grep -rln 'CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY' KernelSU/ 2>/dev/null | sed 's/^/  /' \
+            || echo "  (none)"
+          echo ""
+          echo "--- files containing CMD_SUSFS_SET_UNAME (patch context) ---"
+          grep -rln 'CMD_SUSFS_SET_UNAME' KernelSU/ 2>/dev/null | sed 's/^/  /' \
+            || echo "  (none)"
+          echo ""
+          echo "--- all .c files mentioning CMD_SUSFS ---"
+          grep -rln 'CMD_SUSFS' KernelSU/ 2>/dev/null | grep '\.c$' | sed 's/^/  /' \
+            || echo "  (none)"
+
+      # ══════════════════════════════════════════════════════════
+      #  D. DOES THE REDIRECT COMMAND EXIST?
+      # ══════════════════════════════════════════════════════════
+      - name: "D — CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT"
+        run: |
+          echo "=================================================="
+          echo "  D. KSTAT_REDIRECT COMMAND"
+          echo "=================================================="
+          echo "--- every occurrence, whole tree ---"
+          grep -rn 'CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT' \
+            include/ fs/ KernelSU/ 2>/dev/null | head -30 | sed 's/^/  /' \
+            || echo "  ❌ NOT FOUND ANYWHERE"
+          echo ""
+          echo "--- all CMD_SUSFS_* definitions in susfs_def.h ---"
+          grep -n 'define CMD_SUSFS' include/linux/susfs_def.h 2>/dev/null | sed 's/^/  /' \
+            || echo "  (susfs_def.h absent or no defines)"
+
+      # ══════════════════════════════════════════════════════════
+      #  E. KCONFIG GUARD SYMBOL
+      # ══════════════════════════════════════════════════════════
+      - name: "E — Kconfig guard"
+        run: |
+          echo "=================================================="
+          echo "  E. CONFIG_KSU_SUSFS_SUS_KSTAT_REDIRECT"
+          echo "=================================================="
+          echo "--- in any Kconfig ---"
+          grep -rn 'KSU_SUSFS_SUS_KSTAT_REDIRECT' \
+            drivers/kernelsu/Kconfig KernelSU/kernel/Kconfig 2>/dev/null | sed 's/^/  /' \
+            || echo "  ❌ NOT DECLARED"
+          echo ""
+          echo "--- all KSTAT-related Kconfig entries ---"
+          grep -rn 'KSTAT' drivers/kernelsu/Kconfig 2>/dev/null | sed 's/^/  /' \
+            || echo "  (none)"
+          echo ""
+          echo "--- full SUSFS Kconfig block (for dependency style) ---"
+          grep -A3 '^config KSU_SUSFS' drivers/kernelsu/Kconfig 2>/dev/null \
+            | head -60 | sed 's/^/  /' || echo "  (none)"
+
+      # ══════════════════════════════════════════════════════════
+      #  F. REAL DISPATCHER CODE AROUND THE PATCH TARGET
+      # ══════════════════════════════════════════════════════════
+      - name: "F — dispatcher source context"
+        run: |
+          echo "=================================================="
+          echo "  F. DISPATCHER SOURCE"
+          echo "=================================================="
+          D="$(grep -rl 'CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY' KernelSU/ 2>/dev/null | grep '\.c$' | head -1)"
+          if [ -z "$D" ]; then
+            echo "  (dispatcher not found — nothing to show)"
+          else
+            echo "File: $D"
+            echo "Total lines: $(wc -l < "$D")"
+            echo ""
+            echo "--- KSTAT / UNAME command region ---"
+            grep -n 'CMD_SUSFS' "$D" | sed 's/^/  /'
+            echo ""
+            echo "--- ±25 lines around KSTAT_STATICALLY ---"
+            LN="$(grep -n 'CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY' "$D" | head -1 | cut -d: -f1)"
+            if [ -n "$LN" ]; then
+              S=$(( LN > 25 ? LN - 25 : 1 ))
+              E=$(( LN + 25 ))
+              sed -n "${S},${E}p" "$D" | cat -n | sed "s/^/  /"
+            fi
+          fi
+
+      # ══════════════════════════════════════════════════════════
+      #  G. WHAT DOES 51_ ADD ABOUT REDIRECT?
+      # ══════════════════════════════════════════════════════════
+      - name: "G — 51_ patch: REDIRECT references"
+        run: |
+          echo "=================================================="
+          echo "  G. 51_enhanced vs KSTAT_REDIRECT"
+          echo "=================================================="
+          P51="$(find "$SB_DIR" -maxdepth 1 -name '51_*.patch' | head -1)"
+          echo "File: $P51"
+          echo ""
+          echo "--- lines mentioning REDIRECT ---"
+          grep -n 'REDIRECT' "$P51" 2>/dev/null | head -40 | sed 's/^/  /' \
+            || echo "  ❌ 51_ does not mention REDIRECT at all"
+          echo ""
+          echo "--- lines mentioning KSTAT ---"
+          grep -cn 'KSTAT' "$P51" 2>/dev/null | sed 's/^/  KSTAT mentions: /' || true
+
+      - name: "SUMMARY"
+        if: always()
+        run: |
+          echo "=================================================="
+          echo "  Inspection complete."
+          echo "  Paste sections A-G back to Claude."
+          echo "=================================================="
