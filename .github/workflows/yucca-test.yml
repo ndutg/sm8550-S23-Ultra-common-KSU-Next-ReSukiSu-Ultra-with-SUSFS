@@ -37,11 +37,21 @@ jobs:
             lzop zlib1g-dev pahole dwarves cpio zip unzip \
             python3 python-is-python3 tar perl lz4 jq \
             ccache rsync
+      - name: Free up disk space
+        run: |
+          echo "==> Before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+          echo "==> After cleanup:"
+          df -h /
 
-      - name: Set up swap (24 GB)
+      - name: Set up swap (12 GB)
         uses: pierotofy/set-swap-space@master
         with:
-          swap-size-gb: 24
+          swap-size-gb: 12
 
       - name: Show repo layout
         run: |
@@ -53,6 +63,9 @@ jobs:
           echo ""
           echo "==> Build scripts available:"
           ls -la scripts/build/ 2>/dev/null || echo "(scripts/build not found)"
+          
+      - name: Check disk before build
+        run: df -h /
 
       - name: Build kernel (${{ inputs.mode }})
         run: |
