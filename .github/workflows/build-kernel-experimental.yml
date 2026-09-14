@@ -1,1124 +1,613 @@
-name: "[EXPERIMENTAL] Build SM8550 Kernel — ZeroMount Test"
+name: "[EXP4] SM8550 — Super-Builders full stack"
 
 # ══════════════════════════════════════════════════════════════════
-#  ISOLATION NOTES — READ BEFORE EDITING
+#  EXP3 RESULT THAT DROVE THIS:
 #
-#  This workflow is a SANDBOX copy of build-kernel-updated.yml.
-#  It is deliberately isolated from production:
+#    SOURCE             50_susfs  51_   60_zeromount  70_
+#    yucca-shirkneko    fuzz 3    —     fuzz 3        —
+#    shirkneko-head     fuzz 3    —     fuzz 3        —
+#    simonpunk          fuzz 3    —     fuzz 3        —
+#    super-builders     fuzz 3    0 ✅  0 ✅          FAILED
 #
-#    * NO schedule trigger — manual dispatch only.
-#    * Checks out ${{ github.ref_name }} (the branch it runs from),
-#      NOT a hardcoded android13-5.15.
-#    * Cache keys prefixed  exp-*  so it CANNOT poison the
-#      production delta-changelog SHA cache.
-#    * Artifacts prefixed  EXP-  so they never collide.
-#    * Discord embeds prefixed [EXPERIMENTAL].
+#  ZeroMount applies CLEAN (fuzz 0) only with Super-Builders' own
+#  50_. They are a self-consistent numbered set: 50 -> 51 -> 60 -> 70.
+#  Mixing a standalone SUSFS 50_ with their 60_ is what caused fuzz 3.
 #
-#  Four edits vs production, each in a marked banner:
-#    EDIT 1 — SUSFS tolerant patching (--fuzz=3 + reject detection)
-#    EDIT 2 — ThinLTO
-#    EDIT 3 — ccache
-#    EDIT 4 — ZeroMount  (continue-on-error, will not fail the build)
+#  The residual fuzz 3 on 50_ is a single hunk at fs/proc/task_mmu.c
+#  line 21 — the include block, not a VFS hot path. Identical across
+#  ALL four sources, so it is unavoidable against this tree.
 #
-#  To revert any single edit, delete the block between its
-#  "EDIT n START" and "EDIT n END" markers.
+#  ── TWO FIXES vs EXP3 ────────────────────────────────────────────
+#
+#  FIX 1 — 70_ksu_safety applied from the correct directory.
+#    Its header is  --- a/kernel/supercalls.c  which is ReSukiSU's
+#    kernel/ dir (KernelSU/kernel/), NOT the Linux kernel root.
+#    EXP3 ran it from the kernel root, so patch could not find the
+#    file and silently skipped it.
+#    Now: cd KernelSU && patch -p1 < <abs path>
+#
+#  FIX 2 — fuzz parser detects SKIPPED patches.
+#    GNU patch exits 0 when it skips a file, so EXP3 recorded
+#    "70_ksu_safety : 0 : fuzzed" for a patch that applied NOTHING.
+#    Now scans for: "hunks ignored" | "Skipping patch" |
+#    "can't find file to patch" | "No file to patch"  -> hard FAIL.
+#
+#  Isolation: workflow_dispatch only, exp4-* caches, EXP4-* artifacts.
 # ══════════════════════════════════════════════════════════════════
 
 on:
   workflow_dispatch:
     inputs:
-      build_ksun:
-        description: "Build KernelSU-Next (stable)"
-        type: boolean
-        default: false
-      build_resukisu:
-        description: "Build ReSukiSU (main)"
-        type: boolean
-        default: true
-      enable_zeromount:
-        description: "EDIT 4 — Apply ZeroMount"
+      kernel_repo:
+        description: "Kernel source repo"
+        type: string
+        default: "yucca-a/kernel_samsung_sm8550"
+      apply_51:
+        description: "Apply 51_enhanced_susfs"
         type: boolean
         default: true
-      enable_thinlto:
-        description: "EDIT 2 — Force ThinLTO"
+      apply_60:
+        description: "Apply 60_zeromount"
         type: boolean
         default: true
-      enable_ccache:
-        description: "EDIT 3 — Enable ccache"
+      apply_70:
+        description: "Apply 70_ksu_safety (inside KernelSU/)"
+        type: boolean
+        default: true
+      max_fuzz:
+        description: "Fail if any hunk exceeds this fuzz (0-3, 99 = never)"
+        type: string
+        default: "99"
+      patch_only:
+        description: "Patch + report, then STOP (no compile)"
         type: boolean
         default: true
 
 permissions:
-  contents: write
+  contents: read
   actions: write
-  packages: write
 
 env:
-  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
-  SUSFS_BRANCH: gki-android13-5.15
+  OWN_REPO: ndutg/sm8550-S23-Ultra-common-KSU-Next-ReSukiSu-Ultra-with-SUSFS
+  OWN_REF: android13-5.15
+  ANDROID_VER: android13-5.15
   CLANG_VERSION: r584948
+  SB_REPO: https://github.com/Enginex0/Super-Builders.git
+  SB_COMMIT: c2cb71614868fe742cbffee2b6f3126523432673
+  RESUKISU_SETUP: https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  # Pinned to the commit yucca-a builds against.
-  ZEROMOUNT_REPO: https://github.com/Enginex0/Super-Builders.git
-  ZEROMOUNT_COMMIT: c2cb71614868fe742cbffee2b6f3126523432673
 
 jobs:
 
-  setup:
-    name: Resolve build matrix
+  build:
+    name: "EXP4 super-builders full stack"
     runs-on: ubuntu-24.04
-    outputs:
-      matrix: ${{ steps.build-matrix.outputs.matrix }}
-      is_empty: ${{ steps.build-matrix.outputs.is_empty }}
+    timeout-minutes: 340
+
     steps:
-      - name: Build variant matrix from inputs
-        id: build-matrix
+
+      - name: Free up disk space
         run: |
-          VARIANTS='[]'
-          if [ "${{ inputs.build_ksun }}" = "true" ]; then
-            VARIANTS=$(echo "$VARIANTS" | jq -c '. += [{
-              "variant": "ksun-stable",
-              "display_name": "KernelSU-Next (stable)",
-              "setup_url": "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh",
-              "setup_arg": "main",
-              "ksu_dir": "KernelSU-Next",
-              "artifact_prefix": "ksun-stable",
-              "use_manual_hook": "false"
-            }]')
-          fi
-          if [ "${{ inputs.build_resukisu }}" = "true" ]; then
-            VARIANTS=$(echo "$VARIANTS" | jq -c '. += [{
-              "variant": "resukisu",
-              "display_name": "ReSukiSU (main)",
-              "setup_url": "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh",
-              "setup_arg": "main",
-              "ksu_dir": "KernelSU",
-              "artifact_prefix": "resukisu",
-              "use_manual_hook": "true"
-            }]')
-          fi
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost /usr/local/.ghcup || true
+          sudo rm -rf /usr/share/swift /usr/local/share/powershell || true
+          sudo rm -rf /usr/local/share/chromium /usr/local/lib/node_modules || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY}" || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+          df -h /
 
-          COUNT=$(echo "$VARIANTS" | jq 'length')
-          echo "Selected $COUNT variant(s)."
-          if [ "$COUNT" -eq 0 ]; then
-            echo "is_empty=true" >> $GITHUB_OUTPUT
-            echo 'matrix={"include":[]}' >> $GITHUB_OUTPUT
-            echo "::warning::No variants selected."
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_repo }}
+          ref: main
+          fetch-depth: 1
+
+      - name: Checkout own repo (AnyKernel3)
+        if: ${{ !inputs.patch_only }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.OWN_REPO }}
+          ref: ${{ env.OWN_REF }}
+          fetch-depth: 1
+          path: .own-repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential curl flex \
+            g++-multilib gcc-multilib git gnupg \
+            libelf-dev liblz4-tool libssl-dev \
+            lzop zlib1g-dev pahole dwarves cpio zip unzip \
+            python3 python-is-python3 tar perl lz4 jq ccache rsync
+
+      - name: Setup ReSukiSU
+        run: |
+          curl -sSfL --retry 3 --connect-timeout 20 "${{ env.RESUKISU_SETUP }}" \
+            | bash -s main || { echo "ERROR: setup.sh failed"; exit 1; }
+
+          if [ -L drivers/kernelsu ]; then
+            echo "  drivers/kernelsu -> $(readlink drivers/kernelsu)"
+            [ -d drivers/kernelsu ] && echo "  ✅ resolves" \
+              || { echo "  ❌ DANGLING"; exit 1; }
+          elif [ -d drivers/kernelsu ]; then
+            echo "  ✅ drivers/kernelsu is a directory"
           else
-            echo "is_empty=false" >> $GITHUB_OUTPUT
-            MATRIX=$(printf '{"include":%s}' "$VARIANTS" | jq -c .)
-            echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+            echo "  ❌ missing after setup.sh"; exit 1
           fi
 
-  prepare-clang:
-    name: Cache Clang toolchain
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Restore Clang from cache
+          # FIX 1 groundwork — locate ReSukiSU's own kernel/ dir.
+          if [ -d KernelSU/kernel ]; then
+            echo "  ✅ KernelSU/kernel present (70_ target dir)"
+            ls -1 KernelSU/kernel/ | head -20
+          else
+            echo "  ⚠️  KernelSU/kernel NOT found — 70_ will be skipped"
+          fi
+
+          KSU_TAG=$(git -C KernelSU describe --tags --abbrev=0 2>/dev/null || echo main)
+          KSU_SHA=$(git -C KernelSU rev-parse --short HEAD 2>/dev/null || echo unknown)
+          echo "  ReSukiSU: ${KSU_TAG} @ ${KSU_SHA}"
+          echo "KSU_TAG=${KSU_TAG}" >> $GITHUB_ENV
+          echo "KSU_SHA=${KSU_SHA}" >> $GITHUB_ENV
+          echo "BUILDSUFFIX=resukisu-${KSU_TAG}-manual-hook" >> $GITHUB_ENV
+
+      - name: Fetch Super-Builders
+        run: |
+          git clone "${{ env.SB_REPO }}" sb-src \
+            || { echo "ERROR: clone failed"; exit 1; }
+          git -C sb-src checkout "${{ env.SB_COMMIT }}" \
+            || { echo "ERROR: commit not found"; exit 1; }
+
+          SB_DIR="sb-src/${{ env.ANDROID_VER }}/ReSukiSU/patches"
+          echo "SB_DIR=${SB_DIR}" >> $GITHUB_ENV
+
+          echo ""
+          echo "Patch set in ${SB_DIR}:"
+          ls -la "$SB_DIR" || { echo "ERROR: dir missing"; exit 1; }
+
+      # ══════════════════════════════════════════════════════════
+      # Apply the full numbered stack: 50 -> 51 -> 60 -> 70
+      # ══════════════════════════════════════════════════════════
+      - name: Apply patch stack and measure
+        id: patches
+        run: |
+          mkdir -p /tmp/fuzzlogs
+          : > /tmp/fuzz_summary
+          ROOT="$(pwd)"
+
+          # apply_and_measure <label> <abs_patch> <workdir>
+          apply_and_measure() {
+            local LABEL="$1"
+            local PF="$2"
+            local WD="${3:-$ROOT}"
+            local LOG="/tmp/fuzzlogs/${LABEL}.log"
+
+            echo ""
+            echo "──────────────────────────────────────────────"
+            echo "  APPLYING: ${LABEL}"
+            echo "  Patch   : ${PF}"
+            echo "  WorkDir : ${WD}"
+            echo "──────────────────────────────────────────────"
+
+            if [ ! -f "$PF" ]; then
+              echo "  ⚠️  patch file not found"
+              echo "${LABEL}:X:missing" >> /tmp/fuzz_summary
+              return 1
+            fi
+            if [ ! -d "$WD" ]; then
+              echo "  ⚠️  workdir not found"
+              echo "${LABEL}:X:no-workdir" >> /tmp/fuzz_summary
+              return 1
+            fi
+
+            echo "  Files this patch targets:"
+            grep -E '^\+\+\+ ' "$PF" 2>/dev/null | head -25 | sed 's/^/    /' || true
+            echo ""
+
+            touch /tmp/ts_${LABEL}
+            local RC=0
+
+            pushd "$WD" >/dev/null
+            # --batch --forward makes patch non-interactive: it will
+            # never prompt "File to patch:" and hang.
+            if patch -p1 --batch --forward --dry-run < "$PF" >/dev/null 2>&1; then
+              echo "  ✅ CLEAN APPLY (fuzz=0)"
+              patch -p1 --batch --forward < "$PF" 2>&1 | tee "$LOG"
+              RC=0
+            else
+              echo "  ⚠️  needs fuzz — retrying with --fuzz=3"
+              patch -p1 --batch --forward --fuzz=3 < "$PF" 2>&1 | tee "$LOG"
+              RC=${PIPESTATUS[0]}
+            fi
+            popd >/dev/null
+
+            # ══ FIX 2 ══════════════════════════════════════════
+            # GNU patch exits 0 when it SKIPS a file. EXP3 recorded
+            # 70_ as "0 fuzzed" while it applied nothing at all.
+            # Treat any skip/ignore as a hard failure.
+            # ═══════════════════════════════════════════════════
+            if grep -qE "hunks? ignored|Skipping patch|can't find file to patch|No file to patch" "$LOG" 2>/dev/null; then
+              echo ""
+              echo "  ❌ PATCH SKIPPED — nothing was applied:"
+              grep -E "hunks? ignored|Skipping patch|can't find file to patch|No file to patch" "$LOG" | sed 's/^/    /'
+              echo "${LABEL}:X:skipped" >> /tmp/fuzz_summary
+              return 1
+            fi
+
+            if [ "$RC" -ne 0 ]; then
+              echo "  ❌ FAILED (exit ${RC})"
+              echo "${LABEL}:X:failed" >> /tmp/fuzz_summary
+              find "$WD" -name '*.rej' -newer /tmp/ts_${LABEL} 2>/dev/null | while read -r r; do
+                echo "--- REJECT: $r ---"; head -50 "$r"
+              done
+              return 1
+            fi
+
+            # Rejects anywhere under the workdir
+            local REJ
+            REJ="$(find "$WD" -name '*.rej' -newer /tmp/ts_${LABEL} 2>/dev/null || true)"
+            if [ -n "$REJ" ]; then
+              echo "  ❌ REJECTS PRESENT:"
+              echo "$REJ" | while read -r r; do
+                [ -n "$r" ] || continue
+                echo "--- REJECT: $r ---"; head -50 "$r"
+              done
+              echo "${LABEL}:X:rejects" >> /tmp/fuzz_summary
+              return 1
+            fi
+
+            # Measure worst fuzz
+            local MAXF=0
+            for lvl in 1 2 3; do
+              grep -q "with fuzz ${lvl}" "$LOG" 2>/dev/null && MAXF=$lvl
+            done
+            if [ "$MAXF" -eq 0 ]; then
+              echo "  ✅ applied, fuzz 0"
+              echo "${LABEL}:0:clean" >> /tmp/fuzz_summary
+            else
+              echo "  ⚠️  applied with MAX FUZZ = ${MAXF}"
+              echo "  Fuzzed hunks:"
+              grep -n "with fuzz" "$LOG" | sed 's/^/    /' || true
+              echo "${LABEL}:${MAXF}:fuzzed" >> /tmp/fuzz_summary
+            fi
+            return 0
+          }
+
+          SB_ABS="${ROOT}/${SB_DIR}"
+
+          # ── 50_ SUSFS base (Super-Builders' own) ──
+          apply_and_measure "50_susfs" \
+            "${SB_ABS}/50_add_susfs_in_gki-${{ env.ANDROID_VER }}.patch" \
+            "$ROOT" || exit 1
+
+          # ── 51_ enhanced SUSFS ──
+          if [ "${{ inputs.apply_51 }}" = "true" ]; then
+            P51="$(find "$SB_ABS" -maxdepth 1 -name '51_*.patch' | head -1 || true)"
+            if [ -n "$P51" ]; then
+              apply_and_measure "51_enhanced" "$P51" "$ROOT" || exit 1
+            else
+              echo "  (no 51_ found)"
+            fi
+          fi
+
+          # ── 60_ ZeroMount ──
+          if [ "${{ inputs.apply_60 }}" = "true" ]; then
+            if apply_and_measure "60_zeromount" \
+                 "${SB_ABS}/60_zeromount-${{ env.ANDROID_VER }}.patch" "$ROOT"; then
+              echo "ZEROMOUNT_OK=1" >> $GITHUB_ENV
+            else
+              echo "::warning::ZeroMount not applied"
+            fi
+          fi
+
+          # ══ FIX 1 ══════════════════════════════════════════════
+          # 70_ targets a/kernel/supercalls.c — that is ReSukiSU's
+          # kernel/ dir, i.e. KernelSU/kernel/. Apply from inside
+          # KernelSU/, not the Linux kernel root.
+          # ═══════════════════════════════════════════════════════
+          if [ "${{ inputs.apply_70 }}" = "true" ]; then
+            P70="$(find "$SB_ABS" -maxdepth 1 -name '70_*.patch' | head -1 || true)"
+            if [ -z "$P70" ]; then
+              echo "  (no 70_ found)"
+            elif [ ! -d "${ROOT}/KernelSU" ]; then
+              echo "::warning::KernelSU/ missing — cannot apply 70_"
+              echo "70_ksu_safety:X:no-workdir" >> /tmp/fuzz_summary
+            else
+              echo ""
+              echo "==> 70_ targets ReSukiSU's kernel/ — applying from KernelSU/"
+              if apply_and_measure "70_ksu_safety" "$P70" "${ROOT}/KernelSU"; then
+                echo "KSU_SAFETY_OK=1" >> $GITHUB_ENV
+              else
+                echo "::warning::70_ksu_safety not applied"
+              fi
+            fi
+          fi
+
+          # ── SUSFS Kconfig injection (if 50_ didn't provide it) ──
+          KCFG="drivers/kernelsu/Kconfig"
+          if [ -f "$KCFG" ] && ! grep -q 'KSU_SUSFS' "$KCFG"; then
+            printf '\nconfig KSU_SUSFS\n\tbool "Enable SUSFS for KernelSU"\n\tdepends on KSU\n\tdefault y\n' >> "$KCFG"
+            OPTS=$(grep -hroE 'CONFIG_KSU_SUSFS_[A-Z_]+' \
+              include/linux/susfs.h fs/susfs.c 2>/dev/null \
+              | sort -u | sed 's/CONFIG_KSU_SUSFS_//')
+            for o in $OPTS; do
+              D=$(echo "$o" | tr '_' ' ' | tr '[:upper:]' '[:lower:]')
+              printf '\nconfig KSU_SUSFS_%s\n\tbool "Enable %s"\n\tdepends on KSU_SUSFS\n\tdefault y\n' "$o" "$D" >> "$KCFG"
+            done
+            echo "==> Injected SUSFS Kconfig: $OPTS"
+          else
+            echo "==> SUSFS Kconfig already present."
+          fi
+
+          # ── Verify sources landed ──
+          echo ""
+          echo "==> Source verification:"
+          [ -f fs/susfs.c ]              && echo "  ✅ fs/susfs.c"              || echo "  ❌ fs/susfs.c"
+          [ -f include/linux/susfs.h ]   && echo "  ✅ include/linux/susfs.h"   || echo "  ❌ include/linux/susfs.h"
+          if [ "${ZEROMOUNT_OK:-0}" = "1" ] || [ "${{ inputs.apply_60 }}" = "true" ]; then
+            [ -f fs/zeromount.c ]                && echo "  ✅ fs/zeromount.c"                || echo "  ⚠️  fs/zeromount.c"
+            [ -f include/linux/zeromount.h ]     && echo "  ✅ include/linux/zeromount.h"     || echo "  ⚠️  include/linux/zeromount.h"
+            grep -q 'zeromount' fs/Makefile 2>/dev/null && echo "  ✅ fs/Makefile entry"      || echo "  ⚠️  fs/Makefile entry"
+            grep -rq 'ZEROMOUNT' fs/Kconfig 2>/dev/null && echo "  ✅ fs/Kconfig entry"       || echo "  ⚠️  fs/Kconfig entry"
+          fi
+
+          rm -rf sb-src
+
+      - name: Fuzz report
+        if: always()
+        run: |
+          echo "=================================================="
+          echo "  EXP4 PATCH REPORT — Super-Builders full stack"
+          echo "=================================================="
+          echo ""
+          printf "  %-20s %-8s %s\n" "PATCH" "MAXFUZZ" "RESULT"
+          printf "  %-20s %-8s %s\n" "--------------------" "--------" "----------"
+
+          WORST=0
+          FAILED=0
+          if [ -s /tmp/fuzz_summary ]; then
+            while IFS=: read -r label fuzz result; do
+              [ -n "$label" ] || continue
+              case "$result" in
+                clean)  ICON="✅" ;;
+                fuzzed) ICON="⚠️ " ;;
+                *)      ICON="❌"; FAILED=1 ;;
+              esac
+              printf "  %-20s %-8s %s %s\n" "$label" "$fuzz" "$ICON" "$result"
+              case "$fuzz" in
+                [0-3]) [ "$fuzz" -gt "$WORST" ] && WORST=$fuzz ;;
+                *)     FAILED=1 ;;
+              esac
+            done < /tmp/fuzz_summary
+          else
+            echo "  (nothing recorded)"
+            FAILED=1
+          fi
+
+          echo ""
+          echo "  WORST FUZZ: ${WORST}"
+          echo ""
+          echo "  EXP3 baseline for comparison:"
+          echo "    standalone SUSFS + their 60_  ->  60_zeromount = fuzz 3"
+          echo "    super-builders full stack     ->  60_zeromount = fuzz 0"
+          echo ""
+          echo "  Note: fuzz 3 on 50_susfs is one hunk at"
+          echo "  fs/proc/task_mmu.c line 21 (include block, not a"
+          echo "  VFS hot path). Identical across all four SUSFS"
+          echo "  sources tested — unavoidable against this tree."
+          echo "=================================================="
+
+          {
+            echo "## EXP4 — Super-Builders full stack"
+            echo ""
+            echo "**Kernel:** \`${{ inputs.kernel_repo }}\`  "
+            echo "**ReSukiSU:** \`${KSU_TAG:-n/a}\` @ \`${KSU_SHA:-n/a}\`  "
+            echo "**Worst fuzz:** \`${WORST}\`"
+            echo ""
+            echo "| Patch | Max fuzz | Result |"
+            echo "|---|---|---|"
+            if [ -s /tmp/fuzz_summary ]; then
+              while IFS=: read -r l f r; do
+                [ -n "$l" ] || continue
+                echo "| \`$l\` | $f | $r |"
+              done < /tmp/fuzz_summary
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "WORST_FUZZ=${WORST}" >> $GITHUB_ENV
+
+          MAXF="${{ inputs.max_fuzz }}"
+          if [ "$MAXF" != "99" ] && [ "$WORST" -gt "$MAXF" ]; then
+            echo "::error::Worst fuzz ${WORST} exceeds max_fuzz ${MAXF}"
+            exit 1
+          fi
+          if [ "$FAILED" -eq 1 ]; then
+            echo "::error::One or more patches failed or were skipped"
+            exit 1
+          fi
+          echo "==> Patch gate passed."
+
+      - name: Stop after patching
+        if: inputs.patch_only
+        run: |
+          echo "patch_only=true — stopping before compile."
+          echo "Worst fuzz: ${WORST_FUZZ}"
+          echo "Re-run with patch_only=false to build."
+
+      # ══════════════════════════════════════════════════════════
+      # Build
+      # ══════════════════════════════════════════════════════════
+      - name: Restore Clang
+        if: ${{ !inputs.patch_only }}
         id: cache-clang
         uses: actions/cache@v4
         with:
           path: clang-toolchain
           key: clang-aosp-${{ env.CLANG_VERSION }}
 
-      - name: Download Clang (cache miss only)
-        if: steps.cache-clang.outputs.cache-hit != 'true'
+      - name: Download Clang (cache miss)
+        if: ${{ !inputs.patch_only && steps.cache-clang.outputs.cache-hit != 'true' }}
         run: |
-          echo "Cache miss — downloading AOSP Clang ${{ env.CLANG_VERSION }}..."
-          curl -sSfL --retry 3 --connect-timeout 30 \
-            -o clang.tar.gz \
+          curl -sSfL --retry 3 --connect-timeout 30 -o clang.tar.gz \
             "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/mirror-goog-main-llvm-toolchain-source/clang-${{ env.CLANG_VERSION }}.tar.gz" \
-            || { echo "ERROR: Clang download failed."; exit 1; }
+            || { echo "ERROR: clang download failed"; exit 1; }
           mkdir -p clang-toolchain
           tar -xf clang.tar.gz -C clang-toolchain
           rm -f clang.tar.gz
 
-      - name: Verify Clang
-        run: |
-          export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
-          clang --version || { echo "ERROR: clang binary not found."; exit 1; }
-
-  build:
-    name: "EXP ${{ matrix.display_name }}"
-    needs: [setup, prepare-clang]
-    if: needs.setup.outputs.is_empty == 'false'
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
-
-    steps:
-
-      # Checks out THE BRANCH THIS WORKFLOW RUNS FROM.
-      # Production hardcodes android13-5.15; this follows ref_name so
-      # the experimental branch builds its own source.
-      - name: Checkout kernel source (${{ github.ref_name }})
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
-          fetch-depth: 1
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Show branch context
-        run: |
-          echo "=============================================="
-          echo "  EXPERIMENTAL BUILD"
-          echo "=============================================="
-          echo "  Branch : ${{ github.ref_name }}"
-          echo "  Commit : $(git rev-parse --short HEAD)"
-          echo "  Kernel : $(make kernelversion 2>/dev/null || echo unknown)"
-          echo ""
-          echo "  EDIT 1 SUSFS fuzz  : ALWAYS ON"
-          echo "  EDIT 2 ThinLTO     : ${{ inputs.enable_thinlto }}"
-          echo "  EDIT 3 ccache      : ${{ inputs.enable_ccache }}"
-          echo "  EDIT 4 ZeroMount   : ${{ inputs.enable_zeromount }}"
-          echo "=============================================="
-          if [ "${{ github.ref_name }}" = "android13-5.15" ]; then
-            echo "::warning::Running on the PRODUCTION branch. Caches and artifacts are still isolated, but consider using a test branch."
-          fi
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential curl flex \
-            g++-multilib gcc-multilib git gnupg \
-            lib32readline-dev lib32z1-dev \
-            libelf-dev liblz4-tool libssl-dev \
-            lzop zlib1g-dev pahole dwarves cpio zip \
-            python3 python-is-python3 tar perl lz4 jq \
-            ccache
-
-      - name: Restore Clang ${{ env.CLANG_VERSION }} from cache
-        uses: actions/cache/restore@v4
-        with:
-          path: clang-toolchain
-          key: clang-aosp-${{ env.CLANG_VERSION }}
-          fail-on-cache-miss: true
-
-      - name: Verify Clang
-        run: |
-          export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
-          clang --version || { echo "ERROR: clang not found."; exit 1; }
-
-      - name: Setup ${{ matrix.display_name }}
-        id: ksu
-        run: |
-          echo "==> Setting up ${{ matrix.display_name }}..."
-          curl -sSfL --retry 3 --connect-timeout 20 \
-            "${{ matrix.setup_url }}" \
-            | bash -s "${{ matrix.setup_arg }}" \
-            || { echo "ERROR: setup.sh failed."; exit 1; }
-
-          KSU_DIR="${{ matrix.ksu_dir }}"
-          KSU_TAG=$(git -C "${KSU_DIR}" describe --tags --abbrev=0 2>/dev/null \
-            || git -C "${KSU_DIR}" tag --list 'v[0-9]*' --sort=-v:refname \
-            2>/dev/null | head -1 \
-            || echo "main")
-
-          HOOK_MODE="kprobes"
-          if [ "${{ matrix.use_manual_hook }}" = "true" ]; then
-            HOOK_MODE="manual-hook"
-          fi
-
-          BUILD_SUFFIX="${{ matrix.artifact_prefix }}-${KSU_TAG}-${HOOK_MODE}"
-
-          echo "KSUDIR=${KSU_DIR}"           >> $GITHUB_ENV
-          echo "BUILDSUFFIX=${BUILD_SUFFIX}" >> $GITHUB_ENV
-
-      # ══════════════════════════════════════════════════════════
-      # Delta changelog — cache key prefixed exp- so production
-      # build-shas-* entries are never read or overwritten.
-      # ══════════════════════════════════════════════════════════
-      - name: Restore previous build SHAs (experimental cache)
-        id: prev-build
-        uses: actions/cache/restore@v4
-        with:
-          path: .prev_build_shas
-          key: exp-build-shas-${{ matrix.variant }}-
-          restore-keys: |
-            exp-build-shas-${{ matrix.variant }}-
-
-      - name: Generate build changelog
-        run: |
-          echo "==> Generating smart build changelog..."
-          CHANGELOG="CHANGELOG.txt"
-
-          DATE=$(date '+%Y-%m-%d %H:%M UTC')
-          VARIANT="${{ matrix.display_name }}"
-          KSUDIR_LOCAL="${{ matrix.ksu_dir }}"
-
-          PREV_KERNEL_SHA=""
-          PREV_KSU_SHA=""
-          PREV_SUSFS_SHA=""
-          PREV_DATE=""
-          if [ -f ".prev_build_shas" ]; then
-            PREV_KERNEL_SHA=$(grep '^PREV_KERNEL_SHA=' .prev_build_shas | cut -d= -f2- | tr -d "'")
-            PREV_KSU_SHA=$(grep '^PREV_KSU_SHA=' .prev_build_shas | cut -d= -f2- | tr -d "'")
-            PREV_SUSFS_SHA=$(grep '^PREV_SUSFS_SHA=' .prev_build_shas | cut -d= -f2- | tr -d "'")
-            PREV_DATE=$(grep '^PREV_DATE=' .prev_build_shas | cut -d= -f2- | tr -d "'")
-            echo "  Previous build found: ${PREV_DATE:-unknown}"
-          else
-            echo "  No previous build found — showing last 15 commits"
-          fi
-
-          KERNEL_SHA=$(git rev-parse --short HEAD)
-          KERNEL_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "${{ github.ref_name }}")
-
-          if [ -n "$PREV_KERNEL_SHA" ] && git cat-file -e "${PREV_KERNEL_SHA}^{commit}" 2>/dev/null; then
-            KERNEL_LOG=$(git log --oneline --date=short --format="%ad|%h|%s" "${PREV_KERNEL_SHA}..HEAD")
-            KERNEL_SINCE="since last build (${PREV_DATE})"
-          else
-            KERNEL_LOG=$(git log --oneline --date=short --format="%ad|%h|%s" -15)
-            KERNEL_SINCE="last 15 commits"
-          fi
-
-          KSU_TAG="unknown"
-          KSU_SHA="unknown"
-          KSU_LOG=""
-          KSU_SINCE="last 15 commits"
-          if [ -d "${KSUDIR_LOCAL}" ]; then
-            KSU_TAG=$(git -C "${KSUDIR_LOCAL}" describe --tags --abbrev=0 2>/dev/null \
-              || git -C "${KSUDIR_LOCAL}" tag --list 'v[0-9]*' --sort=-v:refname 2>/dev/null | head -1 \
-              || echo "main")
-            KSU_SHA=$(git -C "${KSUDIR_LOCAL}" rev-parse --short HEAD 2>/dev/null || echo "unknown")
-
-            if [ -n "$PREV_KSU_SHA" ] && git -C "${KSUDIR_LOCAL}" cat-file -e "${PREV_KSU_SHA}^{commit}" 2>/dev/null; then
-              KSU_LOG=$(git -C "${KSUDIR_LOCAL}" log --oneline --date=short --format="%ad|%h|%s" "${PREV_KSU_SHA}..HEAD" 2>/dev/null || echo "")
-              KSU_SINCE="since last build (${PREV_DATE})"
-            else
-              KSU_LOG=$(git -C "${KSUDIR_LOCAL}" log --oneline --date=short --format="%ad|%h|%s" -15 2>/dev/null || echo "")
-              KSU_SINCE="last 15 commits"
-            fi
-          fi
-
-          categorise_commits() {
-            local LOG="$1"
-            local LABEL="$2"
-            local COUNTS_FILE="$3"
-
-            local SEC=0 FIX=0 FEAT=0 LTS=0 OTHER=0
-            local SEC_LINES="" FIX_LINES="" FEAT_LINES="" LTS_LINES="" OTHER_LINES=""
-
-            while IFS='|' read -r cdate chash cmsg; do
-              [ -z "$cmsg" ] && continue
-              cmsg_lower=$(echo "$cmsg" | tr '[:upper:]' '[:lower:]')
-
-              if echo "$cmsg_lower" | grep -qE 'security|cve-|vuln|overflow|use-after-free|oob|uaf|exploit|selinux fix'; then
-                SEC=$((SEC+1))
-                SEC_LINES="${SEC_LINES}    $(printf '\U0001F512') ${cdate}  ${chash}  ${cmsg}\n"
-              elif echo "$cmsg_lower" | grep -qE 'merge.*lts|merge.*5\.15\.|linux 5\.15\.|lts merge|upstream merge'; then
-                LTS=$((LTS+1))
-                LTS_LINES="${LTS_LINES}    $(printf '\U0001F504') ${cdate}  ${chash}  ${cmsg}\n"
-              elif echo "$cmsg_lower" | grep -qE 'fix|bug|crash|panic|null ptr|deadlock|race|hang|oops|regression|revert|resolve|repair'; then
-                FIX=$((FIX+1))
-                FIX_LINES="${FIX_LINES}    $(printf '\U0001F41B') ${cdate}  ${chash}  ${cmsg}\n"
-              elif echo "$cmsg_lower" | grep -qE 'feat|add|support|implement|introduce|enable|new|enhance|improv|optim'; then
-                FEAT=$((FEAT+1))
-                FEAT_LINES="${FEAT_LINES}    $(printf '\u2728') ${cdate}  ${chash}  ${cmsg}\n"
-              else
-                OTHER=$((OTHER+1))
-                OTHER_LINES="${OTHER_LINES}    $(printf '\U0001F527') ${cdate}  ${chash}  ${cmsg}\n"
-              fi
-            done <<< "$LOG"
-
-            echo "  ${LABEL}: ${SEC} security, ${FIX} bug fixes, ${FEAT} features, ${LTS} LTS merges, ${OTHER} other"
-            [ -n "$SEC_LINES" ]   && printf "  -- Security --\n${SEC_LINES}"
-            [ -n "$FIX_LINES" ]   && printf "  -- Bug Fixes --\n${FIX_LINES}"
-            [ -n "$FEAT_LINES" ]  && printf "  -- Features --\n${FEAT_LINES}"
-            [ -n "$LTS_LINES" ]   && printf "  -- LTS / Upstream Merges --\n${LTS_LINES}"
-            [ -n "$OTHER_LINES" ] && printf "  -- Other --\n${OTHER_LINES}"
-
-            echo "${SEC}:${FIX}:${FEAT}:${LTS}:${OTHER}" > "$COUNTS_FILE"
-          }
-
-          KERNEL_RESULT=$(categorise_commits "$KERNEL_LOG" "Kernel" /tmp/kcounts)
-          read K_SEC K_FIX K_FEAT K_LTS K_OTHER <<< $(cat /tmp/kcounts | tr ':' ' ')
-
-          KSU_RESULT=$(categorise_commits "$KSU_LOG" "$VARIANT" /tmp/ksucounts)
-          read KSU_SEC KSU_FIX KSU_FEAT KSU_LTS KSU_OTHER <<< $(cat /tmp/ksucounts | tr ':' ' ')
-
-          TOTAL_SEC=$((K_SEC + KSU_SEC))
-          TOTAL_FIX=$((K_FIX + KSU_FIX))
-          TOTAL_FEAT=$((K_FEAT + KSU_FEAT))
-
-          if [ "$TOTAL_SEC" -gt 0 ]; then
-            PRIORITY="FLASH NOW — Security patches detected"
-            PRIORITY_ICON="$(printf '\U0001F534')"
-          elif [ "$TOTAL_FIX" -gt 2 ] || [ "${K_LTS:-0}" -gt 0 ]; then
-            PRIORITY="RECOMMENDED — Bug fixes or LTS merge"
-            PRIORITY_ICON="$(printf '\U0001F7E1')"
-          elif [ "$TOTAL_FEAT" -gt 0 ] || [ "$TOTAL_FIX" -gt 0 ]; then
-            PRIORITY="OPTIONAL — Minor improvements"
-            PRIORITY_ICON="$(printf '\U0001F7E2')"
-          else
-            PRIORITY="SKIP — Maintenance only, no user-facing changes"
-            PRIORITY_ICON="$(printf '\u26AA')"
-          fi
-
-          PRIORITY_FULL="${PRIORITY_ICON} ${PRIORITY}"
-
-          {
-            echo "======================================================="
-            echo "  SM8550 KERNEL BUILD — EXPERIMENTAL"
-            echo "======================================================="
-            echo ""
-            echo "  Build Date:     ${DATE}"
-            echo "  Branch:         ${{ github.ref_name }}"
-            echo "  Variant:        ${VARIANT}"
-            echo "  Kernel:         ${KERNEL_BRANCH} @ ${KERNEL_SHA}"
-            echo "  KSU:            ${KSU_TAG} @ ${KSU_SHA}"
-            echo "  SUSFS:          ${{ env.SUSFS_BRANCH }} (see below)"
-            if [ -n "$PREV_DATE" ]; then
-              echo "  Previous Build: ${PREV_DATE}"
-            fi
-            echo ""
-            echo "  EXPERIMENTAL FLAGS"
-            echo "    ThinLTO   : ${{ inputs.enable_thinlto }}"
-            echo "    ccache    : ${{ inputs.enable_ccache }}"
-            echo "    ZeroMount : ${{ inputs.enable_zeromount }}"
-            echo ""
-            echo "  +-------------------------------------------+"
-            echo "  |  FLASH PRIORITY: ${PRIORITY_FULL}"
-            echo "  +-------------------------------------------+"
-            echo ""
-            echo "-- KERNEL SOURCE (${KERNEL_SINCE}) -----------"
-            echo "$KERNEL_RESULT"
-            echo ""
-            echo "-- ${VARIANT} (${KSU_SINCE}) --------------"
-            echo "$KSU_RESULT"
-            echo ""
-            echo "-- SUSFS ---------------------------------------"
-            echo "  (appended after SUSFS clone)"
-          } > "$CHANGELOG"
-
-          {
-            echo "## [EXPERIMENTAL] Build: ${VARIANT}"
-            echo ""
-            echo "Branch: \`${{ github.ref_name }}\`"
-            echo ""
-            echo "| Component | Version | Commit |"
-            echo "|---|---|---|"
-            echo "| **Kernel** | \`${KERNEL_BRANCH}\` | \`${KERNEL_SHA}\` |"
-            echo "| **${VARIANT}** | \`${KSU_TAG}\` | \`${KSU_SHA}\` |"
-            echo "| **SUSFS** | \`${{ env.SUSFS_BRANCH }}\` | *(see below)* |"
-            echo ""
-            echo "### Flash Priority: ${PRIORITY_FULL}"
-            echo ""
-            echo "| Category | Kernel | KSU | Total |"
-            echo "|---|---|---|---|"
-            echo "| Security | ${K_SEC} | ${KSU_SEC} | ${TOTAL_SEC} |"
-            echo "| Bug Fixes | ${K_FIX} | ${KSU_FIX} | ${TOTAL_FIX} |"
-            echo "| Features | ${K_FEAT} | ${KSU_FEAT} | ${TOTAL_FEAT} |"
-            echo "| LTS Merges | ${K_LTS:-0} | - | ${K_LTS:-0} |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "CHANGELOG_PATH=${CHANGELOG}" >> $GITHUB_ENV
-          echo "FLASH_PRIORITY=${PRIORITY_FULL}" >> $GITHUB_ENV
-          echo "TOTAL_SEC=${TOTAL_SEC}" >> $GITHUB_ENV
-          echo "TOTAL_FIX=${TOTAL_FIX}" >> $GITHUB_ENV
-          echo "TOTAL_FEAT=${TOTAL_FEAT}" >> $GITHUB_ENV
-          echo "TOTAL_LTS=${K_LTS:-0}" >> $GITHUB_ENV
-          echo "==> Changelog generated."
-
-      - name: Dynamic Header Fixes
-        run: |
-          MAIN_MK="drivers/kernelsu/Makefile"
-          if [ -f "${MAIN_MK}" ]; then
-            if ! grep -q 'ccflags-y += -I$(srctree)/drivers/kernelsu' "${MAIN_MK}"; then
-              printf '\nccflags-y += -I$(srctree)/drivers/kernelsu\n' >> "${MAIN_MK}"
-            fi
-          fi
-
-          echo "==> Scanning for files missing ksu_cred declaration..."
-          FILES=$(grep -rl 'ksu_cred' drivers/kernelsu/ | grep '\.c$' || true)
-          for file in $FILES; do
-            if ! grep -q 'extern struct cred \*ksu_cred' "$file"; then
-              { printf '#include <linux/cred.h>\nextern struct cred *ksu_cred;\n'; cat "$file"; } > "${file}.tmp"
-              mv "${file}.tmp" "$file"
-            fi
-          done
-
-          echo "==> Scanning for files missing allow_shell declaration..."
-          FILES=$(grep -rlE 'allow_shell|ksu_allow_shell' drivers/kernelsu/ | grep '\.c$' || true)
-          for file in $FILES; do
-            if ! grep -E -q 'extern.*allow_shell' "$file"; then
-              { printf '#include <linux/types.h>\nextern bool ksu_allow_shell;\nextern bool allow_shell;\n'; cat "$file"; } > "${file}.tmp"
-              mv "${file}.tmp" "$file"
-            fi
-          done
-
-          echo "==> Scanning for files missing ksu_late_loaded declaration..."
-          FILES=$(grep -rl 'ksu_late_loaded' drivers/kernelsu/ fs/ kernel/ | grep '\.c$' || true)
-          for file in $FILES; do
-            if ! grep -q 'extern bool ksu_late_loaded' "$file"; then
-              { printf '#include <linux/types.h>\nextern bool ksu_late_loaded;\n'; cat "$file"; } > "${file}.tmp"
-              mv "${file}.tmp" "$file"
-            fi
-          done
-
-      - name: Apply SUSFS patches
-        run: |
-          git clone --depth 1 \
-            "${{ env.SUSFS_REPO }}" \
-            -b "${{ env.SUSFS_BRANCH }}" \
-            susfs4ksu \
-            || { echo "ERROR: SUSFS clone failed."; exit 1; }
-
-          cp susfs4ksu/kernel_patches/fs/susfs.c                fs/
-          cp susfs4ksu/kernel_patches/include/linux/susfs.h     include/linux/
-          cp susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
-
-          # ══════════════════════════════════════════════════════
-          # EDIT 1 START — SUSFS tolerant patching
-          #
-          # Production uses a bare `patch -p1 --forward` which hard
-          # fails on ANY drift. yucca-a uses --fuzz=3 and absorbed
-          # hunk offsets up to 51 lines with zero rejects.
-          #
-          # Strategy: clean apply first, fall back to fuzz=3, then
-          # dump any .rej files and fail loudly.
-          #
-          # To revert: replace this block with
-          #   patch -p1 --forward < "$SUSFS_PATCH" || exit 1
-          # ══════════════════════════════════════════════════════
-          SUSFS_PATCH="susfs4ksu/kernel_patches/50_add_susfs_in_${{ env.SUSFS_BRANCH }}.patch"
-          touch /tmp/patch_timestamp
-
-          if patch -p1 --forward --dry-run < "$SUSFS_PATCH" >/dev/null 2>&1; then
-            echo "==> SUSFS main patch applies cleanly (fuzz=0)."
-            patch -p1 --forward < "$SUSFS_PATCH"
-          else
-            echo "==> Clean apply failed — retrying with --fuzz=3 (tolerant)..."
-            if patch -p1 --forward --fuzz=3 < "$SUSFS_PATCH"; then
-              echo "==> SUSFS main patch applied WITH FUZZ TOLERANCE."
-              echo "::warning::SUSFS patch needed fuzz=3 — upstream has drifted."
-            else
-              echo "::error::SUSFS main patch failed even at fuzz=3."
-              find . -name "*.rej" -newer /tmp/patch_timestamp 2>/dev/null | while read -r r; do
-                echo "--- REJECT: $r ---"
-                cat "$r"
-              done
-              exit 1
-            fi
-          fi
-
-          if find . -name "*.rej" -newer /tmp/patch_timestamp 2>/dev/null | grep -q .; then
-            echo "::error::SUSFS patch left reject files:"
-            find . -name "*.rej" -newer /tmp/patch_timestamp | while read -r r; do
-              echo "--- REJECT: $r ---"
-              cat "$r"
-            done
-            exit 1
-          fi
-          echo "==> SUSFS main patch placed with no rejects."
-          # ══════════════════════════════════════════════════════
-          # EDIT 1 END
-          # ══════════════════════════════════════════════════════
-
-          KSU_PATCH="susfs4ksu/kernel_patches/10_enable_susfs_for_ksu.patch"
-          if [ -f "$KSU_PATCH" ]; then
-            echo "==> Attempting KSU driver SUSFS integration patch..."
-            if patch -p1 --forward --dry-run < "$KSU_PATCH" >/dev/null 2>&1; then
-              patch -p1 --forward < "$KSU_PATCH" \
-                || echo "WARNING: KSU driver patch apply failed (will inject Kconfig manually)."
-              echo "==> KSU driver SUSFS patch applied successfully."
-            else
-              echo "==> KSU driver patch already applied or conflicts — injecting Kconfig entries manually."
-            fi
-          else
-            echo "WARNING: $KSU_PATCH not found — will inject Kconfig entries manually."
-          fi
-
-          KSU_KCONFIG="drivers/kernelsu/Kconfig"
-          if [ -f "$KSU_KCONFIG" ]; then
-            if ! grep -q 'KSU_SUSFS' "$KSU_KCONFIG"; then
-              echo "==> SUSFS Kconfig entries missing — extracting from susfs headers..."
-              printf '\nconfig KSU_SUSFS\n\tbool "Enable SUSFS for KernelSU"\n\tdepends on KSU\n\tdefault y\n\thelp\n\t  Patch for SUSFS on KernelSU\n' >> "$KSU_KCONFIG"
-              SUSFS_OPTS=$(grep -hroE 'CONFIG_KSU_SUSFS_[A-Z_]+' susfs4ksu/kernel_patches/include/linux/susfs.h susfs4ksu/kernel_patches/fs/susfs.c 2>/dev/null | sort -u | sed 's/CONFIG_KSU_SUSFS_//')
-              echo "==> Found SUSFS sub-options: $SUSFS_OPTS"
-              for opt in $SUSFS_OPTS; do
-                DESC=$(echo "$opt" | tr '_' ' ' | tr '[:upper:]' '[:lower:]')
-                printf '\nconfig KSU_SUSFS_%s\n\tbool "Enable %s"\n\tdepends on KSU_SUSFS\n\tdefault y\n' "$opt" "$DESC" >> "$KSU_KCONFIG"
-              done
-              echo "==> SUSFS Kconfig entries injected dynamically."
-            else
-              echo "==> SUSFS Kconfig entries already present."
-            fi
-          else
-            echo "ERROR: KernelSU Kconfig not found at $KSU_KCONFIG"
-            exit 1
-          fi
-
-          SUSFS_SHA=$(git -C susfs4ksu rev-parse --short HEAD 2>/dev/null || echo "unknown")
-          SUSFS_LOG=""
-          SUSFS_SINCE="last 15 commits"
-
-          PREV_SUSFS_SHA=""
-          if [ -f ".prev_build_shas" ]; then
-            PREV_SUSFS_SHA=$(grep '^PREV_SUSFS_SHA=' .prev_build_shas | cut -d= -f2- | tr -d "'")
-          fi
-
-          if [ -n "$PREV_SUSFS_SHA" ] && git -C susfs4ksu cat-file -e "${PREV_SUSFS_SHA}^{commit}" 2>/dev/null; then
-            SUSFS_LOG=$(git -C susfs4ksu log --oneline --date=short --format="%ad|%h|%s" "${PREV_SUSFS_SHA}..HEAD" 2>/dev/null || echo "")
-            SUSFS_SINCE="since last build"
-          else
-            SUSFS_LOG=$(git -C susfs4ksu log --oneline --date=short --format="%ad|%h|%s" -15 2>/dev/null || echo "")
-          fi
-
-          if [ -f "$CHANGELOG_PATH" ]; then
-            {
-              echo ""
-              echo "-- SUSFS (${SUSFS_SINCE}) ---------------------"
-              echo "  Branch: ${{ env.SUSFS_BRANCH }} @ ${SUSFS_SHA}"
-              while IFS='|' read -r cdate chash cmsg; do
-                [ -z "$cmsg" ] && continue
-                cmsg_lower=$(echo "$cmsg" | tr '[:upper:]' '[:lower:]')
-                if echo "$cmsg_lower" | grep -qE 'security|cve-|vuln'; then
-                  printf '    \U0001F512 %s  %s  %s\n' "$cdate" "$chash" "$cmsg"
-                elif echo "$cmsg_lower" | grep -qE 'fix|bug|crash'; then
-                  printf '    \U0001F41B %s  %s  %s\n' "$cdate" "$chash" "$cmsg"
-                elif echo "$cmsg_lower" | grep -qE 'feat|add|support|new|enhance'; then
-                  printf '    \u2728 %s  %s  %s\n' "$cdate" "$chash" "$cmsg"
-                else
-                  printf '    \U0001F527 %s  %s  %s\n' "$cdate" "$chash" "$cmsg"
-                fi
-              done <<< "$SUSFS_LOG"
-            } >> "$CHANGELOG_PATH"
-            echo "==> SUSFS changelog appended."
-          fi
-
-          echo "CURRENT_SUSFS_SHA=${SUSFS_SHA}" >> $GITHUB_ENV
-          rm -rf susfs4ksu
-
-      # ══════════════════════════════════════════════════════════
-      # EDIT 4 START — ZeroMount
-      #
-      # Sourced from Enginex0/Super-Builders, pinned to the commit
-      # yucca-a builds against. MUST run AFTER the SUSFS main patch
-      # and BEFORE defconfig generation — wrong ordering is what
-      # broke earlier ZeroMount attempts in this project.
-      #
-      # RECONSTRUCTED from yucca-a's build log, not transcribed from
-      # their source (GitHub only ever returned header comments for
-      # apply_features.sh). Patch filenames are discovered at runtime
-      # rather than assumed.
-      #
-      # continue-on-error: true is DELIBERATE — if ZeroMount cannot
-      # be applied you still get a kernel identical to production,
-      # rather than a failed run.
-      #
-      # To revert: delete this step and the two ZEROMOUNT_OK blocks
-      # further down (config enable + post-build verify).
-      # ══════════════════════════════════════════════════════════
-      - name: Apply ZeroMount
-        id: zeromount
-        if: inputs.enable_zeromount
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          echo "==> Cloning Super-Builders @ ${{ env.ZEROMOUNT_COMMIT }}..."
-
-          git clone "${{ env.ZEROMOUNT_REPO }}" zeromount-src \
-            || { echo "::warning::ZeroMount clone failed — skipping."; exit 1; }
-          git -C zeromount-src checkout "${{ env.ZEROMOUNT_COMMIT }}" \
-            || { echo "::warning::ZeroMount commit not found — skipping."; exit 1; }
-
-          echo ""
-          echo "==> Repository layout (zeromount-related):"
-          find zeromount-src -iname "*zeromount*" -o -iname "*zero_mount*" 2>/dev/null | head -40
-          echo ""
-          echo "==> All .patch files found:"
-          find zeromount-src -name "*.patch" 2>/dev/null | head -60
-          echo ""
-
-          touch /tmp/zm_timestamp
-          APPLIED=0
-          FAILED_PATCHES=""
-
-          # Prefer explicitly zeromount-named patches.
-          PATCH_LIST=$(find zeromount-src -name "*.patch" 2>/dev/null | grep -i -E 'zero.?mount' | sort || true)
-
-          if [ -z "$PATCH_LIST" ]; then
-            echo "::warning::No zeromount-named patches found."
-            echo "==> Directory tree for diagnosis:"
-            find zeromount-src -maxdepth 3 -type d | head -40
-            exit 1
-          fi
-
-          while IFS= read -r p; do
-            [ -f "$p" ] || continue
-            echo "==> Trying: $p"
-            if patch -p1 --forward --fuzz=3 < "$p"; then
-              echo "    ✅ applied"
-              APPLIED=$((APPLIED+1))
-            else
-              echo "    ❌ failed"
-              FAILED_PATCHES="${FAILED_PATCHES} $p"
-            fi
-          done <<< "$PATCH_LIST"
-
-          echo ""
-          echo "==> ZeroMount patches applied: ${APPLIED}"
-          [ -n "$FAILED_PATCHES" ] && echo "==> Failed:${FAILED_PATCHES}"
-
-          if find . -name "*.rej" -newer /tmp/zm_timestamp 2>/dev/null | grep -q .; then
-            echo "::warning::ZeroMount left reject files:"
-            find . -name "*.rej" -newer /tmp/zm_timestamp | while read -r r; do
-              echo "--- REJECT: $r ---"
-              head -40 "$r"
-            done
-          fi
-
-          if [ "$APPLIED" -eq 0 ]; then
-            echo "::warning::No ZeroMount patches applied — continuing without it."
-            exit 1
-          fi
-
-          if [ -f fs/zeromount.c ]; then
-            echo "==> ✅ fs/zeromount.c present."
-          else
-            echo "::warning::fs/zeromount.c missing after patching."
-          fi
-
-          rm -rf zeromount-src
-          echo "ZEROMOUNT_OK=1" >> $GITHUB_ENV
-          echo "==> ZeroMount staged."
-
-      - name: ZeroMount status
-        if: always()
-        run: |
-          if [ "${ZEROMOUNT_OK:-0}" = "1" ]; then
-            echo "✅ ZeroMount APPLIED — CONFIG_ZEROMOUNT will be enabled."
-          elif [ "${{ inputs.enable_zeromount }}" != "true" ]; then
-            echo "⏭️  ZeroMount disabled by input."
-          else
-            echo "⚠️  ZeroMount NOT applied — build continues without it."
-            echo "    Kernel will be equivalent to production."
-          fi
-      # ══════════════════════════════════════════════════════════
-      # EDIT 4 END (part 1 of 3)
-      # ══════════════════════════════════════════════════════════
-
-      - name: Resolve kernel version and date
-        id: meta
-        run: |
-          KVER=$(make kernelversion 2>/dev/null | awk -F. '{print $1"."$2"."$3}')
-          echo "kernelversion=${KVER}" >> $GITHUB_OUTPUT
-          echo "date=$(date +%Y%m%d)"  >> $GITHUB_OUTPUT
-
       - name: Set up swap (24 GB)
+        if: ${{ !inputs.patch_only }}
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 24
 
-      # ══════════════════════════════════════════════════════════
-      # EDIT 3 START — ccache
-      #
-      # yucca-a reports 60-80% faster incremental builds. Cache is
-      # keyed exp-ccache-* so it is separate from production.
-      # Applied via CC="ccache clang" on the BUILD step only —
-      # defconfig/olddefconfig are left untouched to avoid surprises.
-      # ══════════════════════════════════════════════════════════
-      - name: Restore ccache
-        if: inputs.enable_ccache
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.ccache
-          key: exp-ccache-${{ matrix.variant }}-
-          restore-keys: |
-            exp-ccache-${{ matrix.variant }}-
-
-      - name: Configure ccache
-        if: inputs.enable_ccache
-        run: |
-          ccache -M 20G
-          ccache -z
-          echo "CCACHE_ENABLED=1" >> $GITHUB_ENV
-          echo "==> ccache configured (max 20 GB)"
-          ccache -s 2>/dev/null | head -8 || true
-      # ══════════════════════════════════════════════════════════
-      # EDIT 3 END (part 1 of 2)
-      # ══════════════════════════════════════════════════════════
-
       - name: Generate defconfig
+        if: ${{ !inputs.patch_only }}
         run: |
           export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
           make -j$(nproc --all) O=out ARCH=arm64 \
-            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
-            gki_defconfig
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 gki_defconfig
 
-      - name: Dynamically enable configs
+      - name: Enable configs
+        if: ${{ !inputs.patch_only }}
         run: |
           export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
-
           ./scripts/config --file out/.config -e CONFIG_KSU
 
-          KSU_KCONFIG="drivers/kernelsu/Kconfig"
-          echo "==> Dynamically enabling all SUSFS config options..."
-          grep -oE '^config KSU_SUSFS[A-Z_]*' "$KSU_KCONFIG" | while read -r line; do
-            OPT="CONFIG_${line#config }"
-            echo "  Enabling $OPT"
-            ./scripts/config --file out/.config -e "$OPT"
-          done
-
-          if [ "${{ matrix.use_manual_hook }}" = "true" ]; then
-            echo "==> Enabling manual hook mode..."
-            ./scripts/config --file out/.config -e CONFIG_KSU_MANUAL_HOOK
+          KCFG="drivers/kernelsu/Kconfig"
+          if [ -f "$KCFG" ]; then
+            grep -oE '^config KSU_SUSFS[A-Z_]*' "$KCFG" | while read -r l; do
+              ./scripts/config --file out/.config -e "CONFIG_${l#config }"
+            done
           fi
+          ./scripts/config --file out/.config -e CONFIG_KSU_MANUAL_HOOK || true
 
-          # ══════════════════════════════════════════════════════
-          # EDIT 4 (part 2 of 3) — enable ZeroMount if it applied
-          # ══════════════════════════════════════════════════════
           if [ "${ZEROMOUNT_OK:-0}" = "1" ]; then
-            echo "==> Enabling CONFIG_ZEROMOUNT..."
+            echo "==> Enabling CONFIG_ZEROMOUNT"
             ./scripts/config --file out/.config -e CONFIG_ZEROMOUNT
           fi
 
-          # ══════════════════════════════════════════════════════
-          # EDIT 2 START — ThinLTO
-          #
-          # yucca-a: "Selecting ThinLTO (keeps CFI, fits CI memory;
-          # FULL LTO OOMs)". Production LTO step took ~4 min and is
-          # the single biggest OOM risk in the build.
-          #
-          # To revert: delete this block. GKI default will be used.
-          # ══════════════════════════════════════════════════════
-          if [ "${{ inputs.enable_thinlto }}" = "true" ]; then
-            echo "==> Selecting ThinLTO (Full LTO risks OOM on CI)..."
-            ./scripts/config --file out/.config -d LTO_NONE            || true
-            ./scripts/config --file out/.config -e LTO_CLANG           || true
-            ./scripts/config --file out/.config -e LTO_CLANG_THIN      || true
-            ./scripts/config --file out/.config -d LTO_CLANG_FULL      || true
-            ./scripts/config --file out/.config -e CFI_CLANG           || true
-          else
-            echo "==> ThinLTO not forced — using defconfig default."
-          fi
-          # ══════════════════════════════════════════════════════
-          # EDIT 2 END (part 1 of 2)
-          # ══════════════════════════════════════════════════════
+          # ThinLTO — keeps CFI, far lower memory than Full LTO
+          ./scripts/config --file out/.config -d LTO_NONE       || true
+          ./scripts/config --file out/.config -e LTO_CLANG      || true
+          ./scripts/config --file out/.config -e LTO_CLANG_THIN || true
+          ./scripts/config --file out/.config -d LTO_CLANG_FULL || true
+          ./scripts/config --file out/.config -e CFI_CLANG      || true
 
           make -j$(nproc --all) O=out ARCH=arm64 \
-            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
-            olddefconfig
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 olddefconfig
 
-      - name: Verify kernel config (dynamic)
+      - name: Verify config
+        if: ${{ !inputs.patch_only }}
         run: |
-          echo "==> Verifying kernel config options..."
-          CONFIG="out/.config"
-          KSU_KCONFIG="drivers/kernelsu/Kconfig"
-          FAILED=0
-
-          if grep -q 'CONFIG_KSU=y' "$CONFIG"; then
-            echo "  ✅ CONFIG_KSU=y"
-          else
-            echo "  ❌ CONFIG_KSU=y is MISSING!"
-            FAILED=1
-          fi
-
-          if grep -q 'CONFIG_KSU_SUSFS=y' "$CONFIG"; then
-            echo "  ✅ CONFIG_KSU_SUSFS=y"
-          else
-            echo "  ❌ CONFIG_KSU_SUSFS=y is MISSING!"
-            FAILED=1
-          fi
-
+          C=out/.config
+          F=0
+          grep -q 'CONFIG_KSU=y' "$C" && echo "  ✅ CONFIG_KSU=y" || { echo "  ❌ CONFIG_KSU"; F=1; }
+          grep -q 'CONFIG_KSU_SUSFS=y' "$C" && echo "  ✅ CONFIG_KSU_SUSFS=y" || { echo "  ❌ CONFIG_KSU_SUSFS"; F=1; }
           echo "  --- SUSFS sub-options ---"
-          grep -oE '^config KSU_SUSFS_[A-Z_]+' "$KSU_KCONFIG" | while read -r line; do
-            OPT="CONFIG_${line#config }"
-            if grep -q "${OPT}=y" "$CONFIG"; then
-              echo "  ✅ ${OPT}=y"
-            else
-              echo "  ⚠️  ${OPT}=y not set (may have been dropped by olddefconfig)"
-            fi
-          done
-
-          if [ "${{ matrix.use_manual_hook }}" = "true" ]; then
-            echo "  --- Hook mode ---"
-            if grep -q 'CONFIG_KSU_MANUAL_HOOK=y' "$CONFIG"; then
-              echo "  ✅ CONFIG_KSU_MANUAL_HOOK=y (inline hook mode)"
-            else
-              echo "  ℹ️  CONFIG_KSU_MANUAL_HOOK not in .config (driver may handle hooks internally)"
-            fi
-          fi
-
-          # ── EDIT 2 (part 2 of 2) — report LTO mode ──
-          echo "  --- LTO mode ---"
-          if grep -q 'CONFIG_LTO_CLANG_THIN=y' "$CONFIG"; then
-            echo "  ✅ CONFIG_LTO_CLANG_THIN=y (ThinLTO)"
-          elif grep -q 'CONFIG_LTO_CLANG_FULL=y' "$CONFIG"; then
-            echo "  ⚠️  CONFIG_LTO_CLANG_FULL=y (Full LTO — higher OOM risk)"
-          elif grep -q 'CONFIG_LTO_NONE=y' "$CONFIG"; then
-            echo "  ⚠️  CONFIG_LTO_NONE=y (no LTO — CFI likely disabled)"
-          else
-            echo "  ℹ️  LTO mode not detected"
-          fi
-          if grep -q 'CONFIG_CFI_CLANG=y' "$CONFIG"; then
-            echo "  ✅ CONFIG_CFI_CLANG=y"
-          else
-            echo "  ⚠️  CONFIG_CFI_CLANG not set"
-          fi
-
-          # ── EDIT 4 (part 3 of 3) — report ZeroMount config ──
+          grep -E '^CONFIG_KSU_SUSFS_[A-Z_]+=y' "$C" | sed 's/^/  ✅ /' || echo "  ⚠️  none"
           if [ "${ZEROMOUNT_OK:-0}" = "1" ]; then
-            echo "  --- ZeroMount ---"
-            if grep -q 'CONFIG_ZEROMOUNT=y' "$CONFIG"; then
-              echo "  ✅ CONFIG_ZEROMOUNT=y"
-            else
-              echo "  ⚠️  CONFIG_ZEROMOUNT not set (Kconfig entry may be missing)"
-            fi
+            grep -q 'CONFIG_ZEROMOUNT=y' "$C" && echo "  ✅ CONFIG_ZEROMOUNT=y" || echo "  ⚠️  CONFIG_ZEROMOUNT not set"
           fi
+          grep -q 'CONFIG_LTO_CLANG_THIN=y' "$C" && echo "  ✅ ThinLTO" || echo "  ⚠️  not ThinLTO"
+          grep -q 'CONFIG_CFI_CLANG=y' "$C" && echo "  ✅ CFI_CLANG=y" || echo "  ⚠️  CFI off"
+          [ "$F" -eq 1 ] && { echo "::error::critical config missing"; exit 1; }
+          echo "==> Config OK."
 
-          if [ "$FAILED" -eq 1 ]; then
-            echo ""
-            echo "::error::One or more CRITICAL config options are MISSING!"
-            grep -E 'CONFIG_KSU' "$CONFIG" || echo "(none found)"
-            exit 1
-          fi
-
-          echo ""
-          echo "==> Config verification complete."
-
-      - name: Patch Header Refactors
+      - name: Verify no yucca gate
+        if: ${{ !inputs.patch_only }}
         run: |
-          echo "==> Applying fixes for missing KSU identifiers..."
-          sed -i '/#include <linux\/cred.h>/a \
-          extern struct cred *ksu_cred;\
-          extern bool allow_shell;\
-          extern bool ksu_late_loaded;' include/linux/cred.h
+          [ -f .yucca_token ] && { echo "::error::.yucca_token generated"; exit 1; } \
+            || echo "  ✅ no .yucca_token"
 
-          sed -i '/#include <linux\/types.h>/a \
-          extern bool ksu_late_loaded;' include/linux/sched.h
-          echo "==> Headers patched successfully."
-
-      - name: Create KSU hook bridge stubs
-        run: |
-          echo "==> Creating bridge stubs for pre-baked KSU hooks..."
-
-          STATIC_KEY_LINES=""
-          if [ "${{ matrix.use_manual_hook }}" != "true" ]; then
-            STATIC_KEY_LINES=$(printf '%s\n' \
-              'DEFINE_STATIC_KEY_FALSE(ksu_is_init_rc_hook_enabled);' \
-              'DEFINE_STATIC_KEY_FALSE(ksu_is_input_hook_enabled);')
-            echo "  Including static key stubs (KSU-Next variant)"
-          else
-            echo "  Skipping static key stubs (ReSukiSU defines them internally)"
-          fi
-
-          {
-            echo '#include <linux/types.h>'
-            echo '#include <linux/fs.h>'
-            echo '#include <linux/version.h>'
-            echo '#include <linux/jump_label.h>'
-            [ -n "$STATIC_KEY_LINES" ] && echo "$STATIC_KEY_LINES"
-            echo 'int __attribute__((weak)) ksu_handle_sys_reboot(void) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_handle_sys_read(unsigned int fd, char __user *buf, size_t count) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_handle_vfs_fstat(int fd, struct kstat *stat) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_handle_devpts(struct inode *inode) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_input_hook(void *dev, unsigned int type, unsigned int code, int value) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_execveat_hook(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_handle_execveat_sucompat(int *fd, const char __user **filename_user, void *argv, void *envp, int *flags) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_init_rc_hook(const char *data, unsigned long count) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_install_su_fd(void) { return 0; }'
-            echo 'bool __attribute__((weak)) susfs_is_current_ksu_domain(void) { return true; }'
-            echo 'unsigned int __attribute__((weak)) susfs_ksu_sid;'
-            echo 'unsigned int __attribute__((weak)) susfs_priv_app_sid;'
-          } > kernel/ksu_hooks_bridge.c
-
-          if ! grep -q 'ksu_hooks_bridge' kernel/Makefile; then
-            echo 'obj-y += ksu_hooks_bridge.o' >> kernel/Makefile
-          fi
-          echo "==> Bridge stubs created."
-          grep 'ksu_hooks_bridge' kernel/Makefile || echo "WARNING: Entry not found!"
-
-      - name: Build kernel (${{ matrix.display_name }})
+      - name: Build kernel
+        if: ${{ !inputs.patch_only }}
         run: |
           export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
-          echo "==> Compiling: ${{ matrix.display_name }} [${BUILDSUFFIX}]..."
-
-          # ── EDIT 3 (part 2 of 2) — route clang through ccache ──
-          if [ "${CCACHE_ENABLED:-0}" = "1" ]; then
-            echo "==> Building with ccache"
-            CC_ARG='ccache clang'
-          else
-            CC_ARG='clang'
-          fi
-
           make -j$(nproc --all) O=out ARCH=arm64 \
-            CC="${CC_ARG}" LD=ld.lld LLVM=1 LLVM_IAS=1
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1
 
-      - name: ccache stats
-        if: always() && inputs.enable_ccache
-        run: ccache -s 2>/dev/null | head -12 || true
-
-      - name: Save ccache
-        if: success() && inputs.enable_ccache
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.ccache
-          key: exp-ccache-${{ matrix.variant }}-${{ github.run_id }}
-
-      - name: Verify compiled objects
+      - name: Verify objects
+        if: ${{ !inputs.patch_only }}
         run: |
-          echo "==> Post-build verification..."
-          FAILED=0
-
-          if find out/ -name "susfs.o" | grep -q .; then
-            echo "  ✅ fs/susfs.o found — SUSFS was compiled."
-          else
-            echo "  ❌ fs/susfs.o NOT found — SUSFS was NOT compiled!"
-            FAILED=1
-          fi
-
-          # ── EDIT 4 — ZeroMount object check (non-fatal) ──
+          F=0
+          find out/ -name 'susfs.o' | grep -q . && echo "  ✅ susfs.o" || { echo "  ❌ susfs.o"; F=1; }
           if [ "${ZEROMOUNT_OK:-0}" = "1" ]; then
-            if find out/ -name "zeromount.o" | grep -q .; then
-              echo "  ✅ fs/zeromount.o found — ZeroMount compiled."
-            else
-              echo "  ⚠️  fs/zeromount.o NOT found — ZeroMount did not compile."
-            fi
+            find out/ -name 'zeromount.o' | grep -q . \
+              && echo "  ✅ zeromount.o" || echo "  ⚠️  zeromount.o missing"
           fi
+          ls out/arch/arm64/boot/Image* >/dev/null 2>&1 \
+            && { echo "  ✅ Image present"; ls -la out/arch/arm64/boot/Image*; } \
+            || { echo "  ❌ no Image"; F=1; }
+          [ "$F" -eq 1 ] && exit 1 || echo "==> checks passed."
 
-          if [ -f out/arch/arm64/boot/Image.gz ] || [ -f out/arch/arm64/boot/Image ]; then
-            echo "  ✅ Kernel image found."
-          else
-            echo "  ❌ Kernel image NOT found!"
-            FAILED=1
-          fi
-
-          if [ "$FAILED" -eq 1 ]; then
-            echo "::error::Post-build verification FAILED!"
-            exit 1
-          fi
-          echo "==> All post-build checks passed."
-
-      - name: Package AnyKernel3 ZIP
+      - name: Metadata
+        if: ${{ !inputs.patch_only }}
+        id: meta
         run: |
-          cp .github/goodies/AnyKernel3.zip .
-          unzip AnyKernel3.zip -d AnyKernel3
-          if [ -f out/arch/arm64/boot/Image.gz ]; then
-            cp out/arch/arm64/boot/Image.gz AnyKernel3/
-          elif [ -f out/arch/arm64/boot/Image ]; then
-            cp out/arch/arm64/boot/Image AnyKernel3/
-          else
-            echo "ERROR: No kernel Image found"
-            exit 1
-          fi
+          echo "kernelversion=$(make kernelversion 2>/dev/null | awk -F. '{print $1"."$2"."$3}')" >> $GITHUB_OUTPUT
+          echo "date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
 
-          if [ -f "$CHANGELOG_PATH" ]; then
-            cp "$CHANGELOG_PATH" AnyKernel3/
-            echo "==> CHANGELOG.txt included in AnyKernel3 package."
-          fi
-
-      - name: Print build summary
+      - name: Package AnyKernel3
+        if: ${{ !inputs.patch_only }}
         run: |
-          echo ""
-          echo "========================================================"
-          echo "        EXPERIMENTAL BUILD SUMMARY"
-          echo "========================================================"
-          echo ""
-          if [ -f "$CHANGELOG_PATH" ]; then
-            cat "$CHANGELOG_PATH"
-          fi
-          echo ""
-          echo "========================================================"
-          echo "  Branch     : ${{ github.ref_name }}"
-          echo "  ThinLTO    : ${{ inputs.enable_thinlto }}"
-          echo "  ccache     : ${{ inputs.enable_ccache }}"
-          echo "  ZeroMount  : ${ZEROMOUNT_OK:-0} (1 = applied)"
-          echo "  VERDICT    : ${FLASH_PRIORITY}"
-          echo ""
-          echo "  Artifact   : EXP-sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-${{ steps.meta.outputs.date }}"
-          echo "========================================================"
+          AK=".own-repo/.github/goodies/AnyKernel3.zip"
+          mkdir -p AnyKernel3
+          [ -f "$AK" ] && unzip -q "$AK" -d AnyKernel3
+          cp out/arch/arm64/boot/Image* AnyKernel3/ 2>/dev/null || true
+          {
+            echo "SM8550 — EXP4 (Super-Builders full stack)"
+            echo "Kernel    : ${{ steps.meta.outputs.kernelversion }}"
+            echo "Source    : ${{ inputs.kernel_repo }}"
+            echo "ReSukiSU  : ${KSU_TAG} @ ${KSU_SHA}"
+            echo "ZeroMount : ${ZEROMOUNT_OK:-0}"
+            echo "70_safety : ${KSU_SAFETY_OK:-0}"
+            echo "Worst fuzz: ${WORST_FUZZ}"
+            echo ""
+            echo "EXPERIMENTAL — back up boot first:"
+            echo "  dd if=/dev/block/by-name/boot of=/sdcard/boot-backup.img"
+          } > AnyKernel3/CHANGELOG.txt
 
-      # Artifact name prefixed EXP- so it can never be confused with
-      # or overwrite a production build.
       - name: Upload artifact
+        if: ${{ !inputs.patch_only }}
         uses: actions/upload-artifact@v4
         with:
-          name: EXP-sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-${{ steps.meta.outputs.date }}
+          name: EXP4-sm8550-${{ steps.meta.outputs.kernelversion }}-fuzz${{ env.WORST_FUZZ }}-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
           if-no-files-found: warn
-          overwrite: false
 
       - name: Discord notification
         if: always()
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
-            echo "==> Discord webhook not configured — skipping notification."
-            exit 0
-          fi
-
-          echo "==> Sending Discord notification..."
-
+          [ -z "$DISCORD_WEBHOOK_URL" ] && { echo "no webhook"; exit 0; }
           if [ "${{ job.status }}" = "failure" ]; then
-            EMBED_COLOR=15548997
-            PRIORITY_LABEL="❌ EXPERIMENTAL BUILD FAILED — Check logs"
+            COLOR=15548997; ST="❌ EXP4 FAILED"
           else
-            EMBED_COLOR=10181046
-            PRIORITY_LABEL="🧪 EXPERIMENTAL BUILD OK — Do not flash blind"
+            COLOR=10181046; ST="🧪 EXP4 OK"
           fi
-
-          ZM_STATUS="not applied"
-          [ "${ZEROMOUNT_OK:-0}" = "1" ] && ZM_STATUS="applied"
-
-          VARIANT="${{ matrix.display_name }}"
-          ARTIFACT="EXP-sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-${{ steps.meta.outputs.date }}"
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
           PAYLOAD=$(jq -n \
-            --arg title "🧪 [EXPERIMENTAL] SM8550 — ${VARIANT}" \
-            --arg desc "Sandbox build on branch \`${{ github.ref_name }}\`. Production pipeline untouched." \
-            --arg priority "$PRIORITY_LABEL" \
-            --arg zm "🧭 ZeroMount: ${ZM_STATUS}" \
-            --arg lto "⚡ ThinLTO: ${{ inputs.enable_thinlto }}" \
-            --arg cc "🚀 ccache: ${{ inputs.enable_ccache }}" \
-            --arg artifact "$ARTIFACT" \
-            --arg url "$RUN_URL" \
-            --argjson color "$EMBED_COLOR" \
-            '{
-              "embeds": [{
-                "title": $title,
-                "description": $desc,
-                "color": $color,
-                "fields": [
-                  { "name": "Status",     "value": $priority, "inline": false },
-                  { "name": "ZeroMount",  "value": $zm,       "inline": true  },
-                  { "name": "ThinLTO",    "value": $lto,      "inline": true  },
-                  { "name": "ccache",     "value": $cc,       "inline": true  },
-                  { "name": "Artifact",   "value": $artifact, "inline": false },
-                  { "name": "Build Log",  "value": ("[View on GitHub](" + $url + ")"), "inline": false }
-                ],
-                "footer": { "text": "SM8550 Kernel CI • EXPERIMENTAL SANDBOX" },
-                "timestamp": (now | strftime("%Y-%m-%dT%H:%M:%SZ"))
-              }]
-            }')
-
-          curl -sSf -H "Content-Type: application/json" \
-            -d "$PAYLOAD" \
-            "$DISCORD_WEBHOOK_URL" \
-            && echo "==> Discord notification sent." \
-            || echo "WARNING: Discord notification failed (non-fatal)."
-
-      # Saved under exp- prefix — production baseline untouched.
-      - name: Save build SHAs for next run
-        if: success()
-        run: |
-          {
-            echo "PREV_KERNEL_SHA='$(git rev-parse HEAD)'"
-            echo "PREV_KSU_SHA='$(git -C "$KSUDIR" rev-parse HEAD 2>/dev/null || echo '')'"
-            echo "PREV_SUSFS_SHA='${CURRENT_SUSFS_SHA:-}'"
-            echo "PREV_DATE='$(date '+%Y-%m-%d %H:%M UTC')'"
-          } > .prev_build_shas
-          cat .prev_build_shas
-
-      - name: Cache build SHAs (experimental)
-        if: success()
-        uses: actions/cache/save@v4
-        with:
-          path: .prev_build_shas
-          key: exp-build-shas-${{ matrix.variant }}-${{ github.run_id }}
+            --arg t "🧪 [EXP4] SM8550 — Super-Builders full stack" \
+            --arg d "50 → 51 → 60 → 70. patch_only=${{ inputs.patch_only }}" \
+            --arg s "$ST" \
+            --arg f "📏 Worst fuzz: ${WORST_FUZZ:-n/a}" \
+            --arg z "🧭 ZeroMount: ${ZEROMOUNT_OK:-0}" \
+            --arg k "🛡️ 70_safety: ${KSU_SAFETY_OK:-0}" \
+            --arg u "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson c "$COLOR" \
+            '{"embeds":[{"title":$t,"description":$d,"color":$c,"fields":[
+              {"name":"Status","value":$s,"inline":false},
+              {"name":"Fuzz","value":$f,"inline":true},
+              {"name":"ZeroMount","value":$z,"inline":true},
+              {"name":"70_safety","value":$k,"inline":true},
+              {"name":"Log","value":("[View](" + $u + ")"),"inline":false}],
+              "footer":{"text":"SM8550 CI • EXP4"},
+              "timestamp":(now|strftime("%Y-%m-%dT%H:%M:%SZ"))}]}')
+          curl -sSf -H "Content-Type: application/json" -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK_URL" && echo sent || echo "notify failed"
