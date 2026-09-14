@@ -1,0 +1,80 @@
+name: Test — yucca-a SM8550
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Build mode"
+        type: choice
+        options:
+          - resukisu
+          - lkm
+        default: resukisu
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: yucca-a ${{ inputs.mode }}
+    runs-on: ubuntu-24.04
+
+    steps:
+
+      - name: Checkout yucca-a kernel tree
+        uses: actions/checkout@v4
+        with:
+          repository: yucca-a/kernel_samsung_sm8550
+          ref: main
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential curl flex git gnupg \
+            libelf-dev liblz4-tool libssl-dev \
+            lzop zlib1g-dev pahole dwarves cpio zip unzip \
+            python3 python-is-python3 tar perl lz4 jq \
+            ccache rsync
+
+      - name: Set up swap (24 GB)
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 24
+
+      - name: Show repo layout
+        run: |
+          echo "==> Kernel version in Makefile:"
+          make kernelversion 2>/dev/null || head -5 Makefile
+          echo ""
+          echo "==> .kernel_build_mode marker:"
+          cat .kernel_build_mode 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "==> Build scripts available:"
+          ls -la scripts/build/ 2>/dev/null || echo "(scripts/build not found)"
+
+      - name: Build kernel (${{ inputs.mode }})
+        run: |
+          chmod +x scripts/build/*.sh
+          ./scripts/build/build.sh "${{ inputs.mode }}"
+
+      - name: List build output
+        if: always()
+        run: |
+          echo "==> Searching for build artifacts..."
+          find out/ -maxdepth 4 -type f \
+            \( -name "*.zip" -o -name "Image" -o -name "Image.gz" \) \
+            2>/dev/null || echo "(no artifacts found)"
+
+      - name: Upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yucca-${{ inputs.mode }}-${{ github.run_id }}
+          path: |
+            out/${{ inputs.mode }}/**/*.zip
+            out/${{ inputs.mode }}/**/Image
+            out/${{ inputs.mode }}/**/Image.gz
+          compression-level: 9
+          if-no-files-found: warn
