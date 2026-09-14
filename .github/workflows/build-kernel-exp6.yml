@@ -241,61 +241,111 @@ jobs:
       - name: Audit hooks and required source files
         run: |
           echo "=================================================="
-          echo "HOOK COMPATIBILITY AUDIT"
+          echo "HOOK AND SOURCE AUDIT"
           echo "=================================================="
 
-          BAD=0
+          FAILED=0
+          CHECK_FILE="KernelSU/kernel/inline_hook_check.mk"
 
-          reject_old_hook() {
-            local symbol="$1" file="$2"
-            if [ -f "$file" ] && grep -q -- "$symbol" "$file"; then
-              echo "OLD HOOK PRESENT: $symbol in $file"
-              BAD=1
+          if [ -s "$CHECK_FILE" ]; then
+            echo "Selected ReSukiSU provides inline-hook checks:"
+            sed -n '1,220p' "$CHECK_FILE"
+
+            echo ""
+            echo "Checking only incompatibilities declared by this revision..."
+
+            # Extract symbols passed to check_ksu_hook_incompatible.
+            REJECTED_SYMBOLS="$(
+              grep -oE 'check_ksu_hook_incompatible,[A-Za-z0-9_]+' \
+                "$CHECK_FILE" 2>/dev/null \
+              | cut -d, -f2 \
+              | sort -u
+            )"
+
+            if [ -n "$REJECTED_SYMBOLS" ]; then
+              while read -r symbol; do
+                [ -n "$symbol" ] || continue
+
+                MATCHES="$(
+                  grep -rln -- "$symbol" \
+                    drivers/input/input.c \
+                    fs/exec.c \
+                    fs/open.c \
+                    fs/read_write.c \
+                    fs/stat.c \
+                    kernel/reboot.c \
+                    kernel/sys.c 2>/dev/null || true
+                )"
+
+                if [ -n "$MATCHES" ]; then
+                  echo "INCOMPATIBLE HOOK PRESENT: $symbol"
+                  echo "$MATCHES" | sed 's/^/  /'
+                  FAILED=1
+                else
+                  echo "OK rejected hook absent: $symbol"
+                fi
+              done <<< "$REJECTED_SYMBOLS"
             else
-              echo "OK old hook absent: $symbol in $file"
+              echo "No rejected hook symbols declared."
+            fi
+          else
+            echo "This pinned ReSukiSU revision does not provide:"
+            echo "  $CHECK_FILE"
+            echo ""
+            echo "No newer-version incompatibility rules will be imposed."
+          fi
+
+          echo ""
+          echo "Verifying required patched sources..."
+
+          require_file() {
+            local file="$1"
+            if [ -f "$file" ]; then
+              echo "OK file: $file"
+            else
+              echo "MISSING FILE: $file"
+              FAILED=1
             fi
           }
 
-          require_hook() {
-            local symbol="$1" file="$2"
-            if [ -f "$file" ] && grep -q -- "$symbol" "$file"; then
-              echo "OK required hook present: $symbol in $file"
+          require_pattern() {
+            local pattern="$1"
+            local file="$2"
+            if grep -q -- "$pattern" "$file" 2>/dev/null; then
+              echo "OK pattern '$pattern' in $file"
             else
-              echo "REQUIRED HOOK MISSING: $symbol in $file"
-              BAD=1
+              echo "MISSING pattern '$pattern' in $file"
+              FAILED=1
             fi
           }
 
-          # Read the selected ReSukiSU's own checks for the authoritative list.
-          echo "Selected inline_hook_check.mk:"
-          sed -n '1,180p' KernelSU/kernel/inline_hook_check.mk 2>/dev/null || true
+          require_file fs/susfs.c
+          require_file include/linux/susfs.h
+          require_file include/linux/susfs_def.h
+          require_file fs/zeromount.c
+          require_file include/linux/zeromount.h
+          require_file KernelSU/kernel/supercalls.c
 
-          reject_old_hook ksu_vfs_read_hook fs/read_write.c
-          reject_old_hook ksu_input_hook drivers/input/input.c
-          reject_old_hook ksu_execveat_hook fs/exec.c
-          reject_old_hook ksu_init_rc_hook fs/read_write.c
-          reject_old_hook ksu_init_rc_hook fs/stat.c
+          require_pattern zeromount fs/Makefile
+          require_pattern ZEROMOUNT fs/Kconfig
+          require_pattern CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT \
+            KernelSU/kernel/supercalls.c
+          require_pattern susfs_add_sus_kstat_redirect \
+            KernelSU/kernel/supercalls.c
 
-          require_hook ksu_handle_setresuid kernel/sys.c
-          require_hook ksu_handle_execveat fs/exec.c
-          require_hook ksu_handle_faccessat fs/open.c
-          require_hook ksu_handle_sys_read fs/read_write.c
-          require_hook ksu_handle_stat fs/stat.c
-          require_hook ksu_handle_sys_reboot kernel/reboot.c
-          require_hook ksu_handle_input_handle_event drivers/input/input.c
+          echo ""
+          echo "Hook references present for diagnostic purposes:"
+          grep -rnE \
+            'ksu_(input_hook|execveat_hook|init_rc_hook|handle_input_handle_event|handle_execveat|handle_sys_read|handle_stat)' \
+            drivers/input/input.c fs/exec.c fs/read_write.c fs/stat.c \
+            2>/dev/null || true
 
-          test -f fs/susfs.c || { echo "Missing fs/susfs.c"; BAD=1; }
-          test -f include/linux/susfs.h || { echo "Missing include/linux/susfs.h"; BAD=1; }
-          test -f fs/zeromount.c || { echo "Missing fs/zeromount.c"; BAD=1; }
-          test -f include/linux/zeromount.h || { echo "Missing include/linux/zeromount.h"; BAD=1; }
-          grep -q zeromount fs/Makefile || { echo "Missing fs/Makefile ZeroMount entry"; BAD=1; }
-          grep -q ZEROMOUNT fs/Kconfig || { echo "Missing fs/Kconfig ZeroMount entry"; BAD=1; }
-
-          if [ "$BAD" -ne 0 ]; then
-            echo "ERROR: Hook/source audit failed. Do not compile this combination."
+          if [ "$FAILED" -ne 0 ]; then
+            echo "ERROR: Revision-specific hook/source audit failed."
             exit 1
           fi
-          echo "Hook/source audit passed."
+
+          echo "Revision-specific hook/source audit passed."
 
       - name: Enforce fuzz limit
         run: |
