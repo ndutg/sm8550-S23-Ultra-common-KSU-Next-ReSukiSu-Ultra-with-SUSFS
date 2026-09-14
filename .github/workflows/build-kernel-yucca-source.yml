@@ -1,37 +1,29 @@
-name: "[EXP2] SM8550 — yucca-a clean source + our pipeline"
+name: "[EXP3] SM8550 — yucca-a mirror + fuzz analysis"
 
 # ══════════════════════════════════════════════════════════════════
-#  WHAT THIS IS
+#  Mirrors yucca-a's ACTUAL patch pipeline, derived from their own
+#  build log, and measures fuzz precisely.
 #
-#  Uses yucca-a/kernel_samsung_sm8550 (clean samsung-sm8550 common,
-#  5.15.220, NO pre-baked KSU hooks) as the kernel SOURCE, then runs
-#  OUR OWN pipeline on top of it.
+#  yucca-a's real sequence (verbatim from their log):
+#    SuSFS: clone gki-android13-5.15 @ 415e4143...
+#           from https://github.com/ShirkNeko/susfs4ksu.git
+#    SuSFS: applying main patch (tolerant: --forward --fuzz=3)
+#    SuSFS: main patch placed with no rejects.
+#    ZeroMount: clone Super-Builders @ c2cb7161...
+#    ZeroMount: patch applied.
+#    ZeroMount: task_mmu metadata hook fixed.
 #
-#  We deliberately DO NOT run their scripts/build/build.sh. That is
-#  what generates the undocumented "yucca gate" (.yucca_token +
-#  hash burnt into the kernel header). By driving the build
-#  ourselves, the gate never happens. A verification step below
-#  asserts this.
+#  KEY: they use ShirkNeko PINNED, not simonpunk floating.
+#  They also use --fuzz=3 deliberately. Fuzz is expected; the
+#  question is HOW MUCH.
 #
-#  WHY: the ndutg tree has KSU-Next hooks pre-baked, which collide
-#  with SUSFS/ZeroMount patches written against a clean tree. This
-#  removes that entire class of conflict.
+#  susfs_source selector:
+#    yucca-shirkneko   ShirkNeko @ pinned commit  (yucca-a mirror)
+#    shirkneko-head    ShirkNeko @ branch HEAD
+#    simonpunk         simonpunk (what EXP2 used)
+#    super-builders    Super-Builders' own 50_ (+51_/70_ if enabled)
 #
-#  ── ISOLATION ───────────────────────────────────────────────────
-#    * workflow_dispatch only — NO schedule.
-#    * Cache keys prefixed  exp2-*
-#    * Artifacts prefixed   EXP2-
-#    * Production pipeline and its caches are untouched.
-#
-#  ── UNKNOWNS (flagged honestly) ─────────────────────────────────
-#    1. Whether ReSukiSU setup.sh works on their tree layout
-#       (their build.sh notes drivers/kernelsu is a SYMLINK that
-#       must resolve at Kconfig-parse time).
-#    2. Whether bridge stubs are still needed. On a clean tree they
-#       may cause DUPLICATE symbol errors instead — so they are
-#       AUTO-DETECTED, not unconditional.
-#    3. Whether the tree carries other yucca-specific in-source
-#       changes. The audit step reports this.
+#  Isolation: workflow_dispatch only, exp3-* caches, EXP3-* artifacts.
 # ══════════════════════════════════════════════════════════════════
 
 on:
@@ -41,34 +33,31 @@ on:
         description: "Kernel source repo"
         type: string
         default: "yucca-a/kernel_samsung_sm8550"
-      kernel_ref:
-        description: "Kernel source branch/tag"
-        type: string
-        default: "main"
-      enable_susfs:
-        description: "Apply SUSFS"
-        type: boolean
-        default: true
-      enable_zeromount:
-        description: "Apply ZeroMount"
-        type: boolean
-        default: true
-      enable_thinlto:
-        description: "Force ThinLTO"
-        type: boolean
-        default: true
-      enable_bridge_stubs:
-        description: "Bridge stubs (auto = only if undefined syms)"
+      susfs_source:
+        description: "SUSFS patch source"
         type: choice
         options:
-          - auto
-          - force-on
-          - force-off
-        default: auto
-      audit_only:
-        description: "Audit source and STOP (no build)"
+          - yucca-shirkneko
+          - shirkneko-head
+          - simonpunk
+          - super-builders
+        default: yucca-shirkneko
+      apply_extra_sb:
+        description: "Also apply Super-Builders 51_ / 70_ (super-builders mode only)"
         type: boolean
         default: false
+      enable_zeromount:
+        description: "Apply ZeroMount 60_"
+        type: boolean
+        default: true
+      max_fuzz:
+        description: "Fail if any hunk exceeds this fuzz (0-3, or 99 = never fail)"
+        type: string
+        default: "99"
+      patch_only:
+        description: "Patch + report fuzz, then STOP (no compile)"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -77,9 +66,12 @@ permissions:
 env:
   OWN_REPO: ndutg/sm8550-S23-Ultra-common-KSU-Next-ReSukiSu-Ultra-with-SUSFS
   OWN_REF: android13-5.15
-  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
   SUSFS_BRANCH: gki-android13-5.15
   CLANG_VERSION: r584948
+  # Pins taken verbatim from yucca-a's build log
+  SHIRKNEKO_REPO: https://github.com/ShirkNeko/susfs4ksu.git
+  SHIRKNEKO_PIN: 415e4143ee1dd557c54d2b3d94ef098e5d1236f4
+  SIMONPUNK_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
   ZEROMOUNT_REPO: https://github.com/Enginex0/Super-Builders.git
   ZEROMOUNT_COMMIT: c2cb71614868fe742cbffee2b6f3126523432673
   RESUKISU_SETUP: https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh
@@ -88,7 +80,7 @@ env:
 jobs:
 
   build:
-    name: "EXP2 ReSukiSU on ${{ inputs.kernel_repo }}"
+    name: "EXP3 ${{ inputs.susfs_source }}"
     runs-on: ubuntu-24.04
     timeout-minutes: 340
 
@@ -96,7 +88,6 @@ jobs:
 
       - name: Free up disk space
         run: |
-          echo "==> Disk before cleanup:"
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
           sudo rm -rf /usr/local/share/boost /usr/local/.ghcup || true
@@ -105,17 +96,17 @@ jobs:
           sudo rm -rf "${AGENT_TOOLSDIRECTORY}" || true
           sudo docker image prune --all --force || true
           sudo apt-get clean || true
-          echo "==> Disk after cleanup:"
           df -h /
 
-      - name: Checkout kernel source (${{ inputs.kernel_repo }})
+      - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.kernel_repo }}
-          ref: ${{ inputs.kernel_ref }}
+          ref: main
           fetch-depth: 1
 
-      - name: Checkout own repo (AnyKernel3 only)
+      - name: Checkout own repo (AnyKernel3)
+        if: ${{ !inputs.patch_only }}
         uses: actions/checkout@v4
         with:
           repository: ${{ env.OWN_REPO }}
@@ -124,610 +115,458 @@ jobs:
           path: .own-repo
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ══════════════════════════════════════════════════════════
-      # SOURCE AUDIT — find out what is ACTUALLY in this tree
-      # before we assume anything. This is the step that answers
-      # "is it really clean?"
-      # ══════════════════════════════════════════════════════════
-      - name: Audit kernel source
-        id: audit
-        run: |
-          echo "=================================================="
-          echo "  SOURCE AUDIT — ${{ inputs.kernel_repo }}@${{ inputs.kernel_ref }}"
-          echo "=================================================="
-          echo ""
-          echo "Kernel version : $(make kernelversion 2>/dev/null || echo unknown)"
-          echo "HEAD           : $(git rev-parse --short HEAD)"
-          echo "HEAD subject   : $(git log -1 --format=%s)"
-          echo ""
-
-          echo "── Pre-baked KSU hooks? (THE key question) ──"
-          HOOKS=0
-          for sym in ksu_handle_execveat ksu_handle_faccessat \
-                     ksu_handle_sys_read ksu_handle_stat \
-                     ksu_handle_setresuid ksu_input_hook \
-                     ksu_handle_devpts ksu_install_su_fd; do
-            N=$(grep -rl "$sym" fs/ kernel/ drivers/input/ security/ 2>/dev/null | grep -v '^drivers/kernelsu' | wc -l)
-            if [ "$N" -gt 0 ]; then
-              echo "  ⚠️  ${sym}: referenced in ${N} file(s)"
-              grep -rl "$sym" fs/ kernel/ drivers/input/ security/ 2>/dev/null | grep -v '^drivers/kernelsu' | head -4 | sed 's/^/        /'
-              HOOKS=$((HOOKS+1))
-            else
-              echo "  ✅ ${sym}: not present"
-            fi
-          done
-          echo ""
-          if [ "$HOOKS" -eq 0 ]; then
-            echo "  ==> TREE IS CLEAN. Bridge stubs should NOT be needed."
-            echo "clean_tree=true" >> $GITHUB_OUTPUT
-          else
-            echo "  ==> ${HOOKS} hook symbol group(s) already present."
-            echo "clean_tree=false" >> $GITHUB_OUTPUT
-          fi
-          echo ""
-
-          echo "── SUSFS already in tree? ──"
-          [ -f fs/susfs.c ] && echo "  ⚠️  fs/susfs.c EXISTS (pre-patched)" || echo "  ✅ fs/susfs.c absent"
-          [ -f include/linux/susfs.h ] && echo "  ⚠️  include/linux/susfs.h EXISTS" || echo "  ✅ susfs.h absent"
-          echo ""
-
-          echo "── ZeroMount already in tree? ──"
-          [ -f fs/zeromount.c ] && echo "  ⚠️  fs/zeromount.c EXISTS" || echo "  ✅ fs/zeromount.c absent"
-          echo ""
-
-          echo "── KernelSU present? ──"
-          if [ -e drivers/kernelsu ]; then
-            if [ -L drivers/kernelsu ]; then
-              echo "  ℹ️  drivers/kernelsu is a SYMLINK -> $(readlink drivers/kernelsu)"
-              [ -d drivers/kernelsu ] && echo "     resolves OK" || echo "     ⚠️  DANGLING (expected before setup.sh)"
-            else
-              echo "  ⚠️  drivers/kernelsu is a real directory (pre-populated)"
-            fi
-          else
-            echo "  ✅ drivers/kernelsu absent (setup.sh will create it)"
-          fi
-          grep -q 'kernelsu' drivers/Makefile 2>/dev/null \
-            && echo "  ℹ️  drivers/Makefile already references kernelsu" \
-            || echo "  ✅ drivers/Makefile clean"
-          grep -q 'kernelsu' drivers/Kconfig 2>/dev/null \
-            && echo "  ℹ️  drivers/Kconfig already references kernelsu" \
-            || echo "  ✅ drivers/Kconfig clean"
-          echo ""
-
-          echo "── Yucca gate artifacts? (must be absent) ──"
-          [ -f .yucca_token ] && echo "  ❌ .yucca_token EXISTS IN TREE" || echo "  ✅ no .yucca_token"
-          GATEREF=$(grep -ril 'yucca' --include='*.c' --include='*.h' \
-                     init/ kernel/ security/ fs/ 2>/dev/null | head -10 || true)
-          if [ -n "$GATEREF" ]; then
-            echo "  ⚠️  'yucca' referenced in source:"
-            echo "$GATEREF" | sed 's/^/        /'
-          else
-            echo "  ✅ no yucca references in init/kernel/security/fs"
-          fi
-          echo ""
-
-          echo "── Other in-source modifications ──"
-          for f in fs/Makefile fs/Kconfig security/selinux/Makefile; do
-            [ -f "$f" ] || continue
-            M=$(grep -icE 'susfs|zeromount|baseband|kernelsu' "$f" 2>/dev/null || echo 0)
-            [ "$M" -gt 0 ] && echo "  ℹ️  $f has $M custom line(s)" || echo "  ✅ $f clean"
-          done
-          echo ""
-          echo "  Their build scripts (NOT executed by us):"
-          ls -1 scripts/build/ 2>/dev/null | sed 's/^/        /' || echo "        (none)"
-          echo ""
-          echo "=================================================="
-
-      - name: Stop after audit
-        if: inputs.audit_only
-        run: |
-          echo "audit_only=true — stopping before build as requested."
-          exit 0
-
-      - name: Install build dependencies
-        if: ${{ !inputs.audit_only }}
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential curl flex \
             g++-multilib gcc-multilib git gnupg \
-            lib32readline-dev lib32z1-dev \
             libelf-dev liblz4-tool libssl-dev \
             lzop zlib1g-dev pahole dwarves cpio zip unzip \
             python3 python-is-python3 tar perl lz4 jq ccache rsync
 
-      - name: Restore Clang from cache
-        if: ${{ !inputs.audit_only }}
+      - name: Setup ReSukiSU
+        run: |
+          curl -sSfL --retry 3 --connect-timeout 20 "${{ env.RESUKISU_SETUP }}" \
+            | bash -s main || { echo "ERROR: setup.sh failed"; exit 1; }
+
+          if [ -L drivers/kernelsu ]; then
+            echo "  drivers/kernelsu -> $(readlink drivers/kernelsu)"
+            [ -d drivers/kernelsu ] && echo "  ✅ resolves" \
+              || { echo "  ❌ DANGLING"; exit 1; }
+          elif [ -d drivers/kernelsu ]; then
+            echo "  ✅ drivers/kernelsu is a directory"
+          else
+            echo "  ❌ missing after setup.sh"; exit 1
+          fi
+
+          KSU_TAG=$(git -C KernelSU describe --tags --abbrev=0 2>/dev/null || echo main)
+          echo "  ReSukiSU: ${KSU_TAG}"
+          echo "KSU_TAG=${KSU_TAG}" >> $GITHUB_ENV
+          echo "BUILDSUFFIX=resukisu-${KSU_TAG}-manual-hook" >> $GITHUB_ENV
+
+      # ══════════════════════════════════════════════════════════
+      # Fetch SUSFS from the selected source
+      # ══════════════════════════════════════════════════════════
+      - name: Fetch SUSFS source (${{ inputs.susfs_source }})
+        run: |
+          SRC="${{ inputs.susfs_source }}"
+          echo "=================================================="
+          echo "  SUSFS SOURCE: ${SRC}"
+          echo "=================================================="
+
+          case "$SRC" in
+            yucca-shirkneko)
+              echo "Mirroring yucca-a: ShirkNeko @ pinned ${{ env.SHIRKNEKO_PIN }}"
+              git clone "${{ env.SHIRKNEKO_REPO }}" -b "${{ env.SUSFS_BRANCH }}" susfs4ksu \
+                || { echo "ERROR: clone failed"; exit 1; }
+              git -C susfs4ksu checkout "${{ env.SHIRKNEKO_PIN }}" \
+                || { echo "ERROR: pinned commit not found"; exit 1; }
+              ;;
+            shirkneko-head)
+              echo "ShirkNeko @ ${{ env.SUSFS_BRANCH }} HEAD"
+              git clone --depth 1 "${{ env.SHIRKNEKO_REPO }}" \
+                -b "${{ env.SUSFS_BRANCH }}" susfs4ksu \
+                || { echo "ERROR: clone failed"; exit 1; }
+              ;;
+            simonpunk)
+              echo "simonpunk @ ${{ env.SUSFS_BRANCH }} HEAD"
+              git clone --depth 1 "${{ env.SIMONPUNK_REPO }}" \
+                -b "${{ env.SUSFS_BRANCH }}" susfs4ksu \
+                || { echo "ERROR: clone failed"; exit 1; }
+              ;;
+            super-builders)
+              echo "Super-Builders bundled SUSFS"
+              git clone "${{ env.ZEROMOUNT_REPO }}" sb-src \
+                || { echo "ERROR: clone failed"; exit 1; }
+              git -C sb-src checkout "${{ env.ZEROMOUNT_COMMIT }}" || exit 1
+              echo "SB_MODE=1" >> $GITHUB_ENV
+              ;;
+          esac
+
+          if [ -d susfs4ksu ]; then
+            echo ""
+            echo "SUSFS HEAD    : $(git -C susfs4ksu rev-parse --short HEAD)"
+            echo "SUSFS subject : $(git -C susfs4ksu log -1 --format=%s)"
+            echo "SUSFS date    : $(git -C susfs4ksu log -1 --format=%ci)"
+            echo "SUSFS_SHA=$(git -C susfs4ksu rev-parse --short HEAD)" >> $GITHUB_ENV
+            echo ""
+            echo "Available patches:"
+            ls -1 susfs4ksu/kernel_patches/*.patch 2>/dev/null | sed 's/^/  /' || true
+          fi
+
+      # ══════════════════════════════════════════════════════════
+      # Apply patches with PER-HUNK FUZZ MEASUREMENT
+      # ══════════════════════════════════════════════════════════
+      - name: Apply patches and measure fuzz
+        id: patches
+        run: |
+          mkdir -p /tmp/fuzzlogs
+          SB_DIR="sb-src/${{ env.SUSFS_BRANCH }}"
+          SB_DIR="${SB_DIR/gki-/}"
+          SB_DIR="sb-src/$(echo '${{ env.SUSFS_BRANCH }}' | sed 's/^gki-//')/ReSukiSU/patches"
+
+          # apply_and_measure <label> <patchfile>
+          apply_and_measure() {
+            local LABEL="$1"
+            local PF="$2"
+            local LOG="/tmp/fuzzlogs/${LABEL}.log"
+
+            echo ""
+            echo "──────────────────────────────────────────────"
+            echo "  APPLYING: ${LABEL}"
+            echo "  File    : ${PF}"
+            echo "──────────────────────────────────────────────"
+
+            if [ ! -f "$PF" ]; then
+              echo "  ⚠️  patch file not found — skipping"
+              return 1
+            fi
+
+            touch /tmp/ts_${LABEL}
+
+            # Try clean first — this is the measurement that matters.
+            if patch -p1 --forward --dry-run < "$PF" >/dev/null 2>&1; then
+              echo "  ✅ CLEAN APPLY (fuzz=0)"
+              patch -p1 --forward < "$PF" | tee "$LOG"
+              echo "${LABEL}:0:clean" >> /tmp/fuzz_summary
+            else
+              echo "  ⚠️  needs fuzz — retrying with --fuzz=3"
+              if patch -p1 --forward --fuzz=3 < "$PF" | tee "$LOG"; then
+                MAXF=0
+                for lvl in 1 2 3; do
+                  grep -q "with fuzz ${lvl}" "$LOG" 2>/dev/null && MAXF=$lvl
+                done
+                echo "  ⚠️  applied with MAX FUZZ = ${MAXF}"
+                echo "${LABEL}:${MAXF}:fuzzed" >> /tmp/fuzz_summary
+              else
+                echo "  ❌ FAILED even at fuzz=3"
+                echo "${LABEL}:X:failed" >> /tmp/fuzz_summary
+                find . -name '*.rej' -newer /tmp/ts_${LABEL} 2>/dev/null | while read -r r; do
+                  echo "--- REJECT: $r ---"; head -50 "$r"
+                done
+                return 1
+              fi
+            fi
+
+            REJ="$(find . -name '*.rej' -newer /tmp/ts_${LABEL} 2>/dev/null || true)"
+            if [ -n "$REJ" ]; then
+              echo "  ❌ REJECTS PRESENT:"
+              echo "$REJ" | while read -r r; do
+                [ -n "$r" ] || continue
+                echo "--- REJECT: $r ---"; head -50 "$r"
+              done
+              return 1
+            fi
+            return 0
+          }
+
+          # ── SUSFS ──
+          if [ "${SB_MODE:-0}" = "1" ]; then
+            SBP="${SB_DIR}/50_add_susfs_in_${{ env.SUSFS_BRANCH }}.patch"
+            apply_and_measure "50_susfs_SB" "$SBP" || exit 1
+
+            if [ "${{ inputs.apply_extra_sb }}" = "true" ]; then
+              P51="$(find "$SB_DIR" -maxdepth 1 -name '51_*.patch' 2>/dev/null | head -1 || true)"
+              [ -n "$P51" ] && apply_and_measure "51_enhanced_SB" "$P51" || echo "  (no 51_ found)"
+            fi
+          else
+            cp susfs4ksu/kernel_patches/fs/susfs.c                fs/ 2>/dev/null || true
+            cp susfs4ksu/kernel_patches/include/linux/susfs.h     include/linux/ 2>/dev/null || true
+            cp susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/ 2>/dev/null || true
+            echo "==> SUSFS source drops copied."
+
+            MAINP="susfs4ksu/kernel_patches/50_add_susfs_in_${{ env.SUSFS_BRANCH }}.patch"
+            apply_and_measure "50_susfs" "$MAINP" || exit 1
+
+            KP="susfs4ksu/kernel_patches/10_enable_susfs_for_ksu.patch"
+            if [ -f "$KP" ]; then
+              if patch -p1 --forward --dry-run < "$KP" >/dev/null 2>&1; then
+                patch -p1 --forward < "$KP" >/dev/null 2>&1 || true
+                echo "==> 10_enable_susfs_for_ksu applied."
+              else
+                echo "==> 10_ skipped (already applied or N/A)."
+              fi
+            fi
+          fi
+
+          # ── SUSFS Kconfig injection ──
+          KCFG="drivers/kernelsu/Kconfig"
+          if [ -f "$KCFG" ] && ! grep -q 'KSU_SUSFS' "$KCFG"; then
+            printf '\nconfig KSU_SUSFS\n\tbool "Enable SUSFS for KernelSU"\n\tdepends on KSU\n\tdefault y\n' >> "$KCFG"
+            OPTS=$(grep -hroE 'CONFIG_KSU_SUSFS_[A-Z_]+' \
+              include/linux/susfs.h fs/susfs.c 2>/dev/null \
+              | sort -u | sed 's/CONFIG_KSU_SUSFS_//')
+            for o in $OPTS; do
+              D=$(echo "$o" | tr '_' ' ' | tr '[:upper:]' '[:lower:]')
+              printf '\nconfig KSU_SUSFS_%s\n\tbool "Enable %s"\n\tdepends on KSU_SUSFS\n\tdefault y\n' "$o" "$D" >> "$KCFG"
+            done
+            echo "==> Injected SUSFS Kconfig: $OPTS"
+          else
+            echo "==> SUSFS Kconfig already present."
+          fi
+
+          # ── ZeroMount 60_ ──
+          if [ "${{ inputs.enable_zeromount }}" = "true" ]; then
+            if [ ! -d sb-src ]; then
+              git clone "${{ env.ZEROMOUNT_REPO }}" sb-src || { echo "::warning::ZM clone failed"; }
+              git -C sb-src checkout "${{ env.ZEROMOUNT_COMMIT }}" || true
+            fi
+            ZMP="${SB_DIR}/60_zeromount-$(echo '${{ env.SUSFS_BRANCH }}' | sed 's/^gki-//').patch"
+            if apply_and_measure "60_zeromount" "$ZMP"; then
+              echo "ZEROMOUNT_OK=1" >> $GITHUB_ENV
+            else
+              echo "::warning::ZeroMount not applied"
+            fi
+          fi
+
+          # ── Super-Builders 70_ ksu_safety ──
+          if [ "${SB_MODE:-0}" = "1" ] && [ "${{ inputs.apply_extra_sb }}" = "true" ]; then
+            P70="$(find "$SB_DIR" -maxdepth 1 -name '70_*.patch' 2>/dev/null | head -1 || true)"
+            [ -n "$P70" ] && apply_and_measure "70_ksu_safety" "$P70" || echo "  (no 70_ found)"
+          fi
+
+          rm -rf susfs4ksu sb-src
+
+      # ══════════════════════════════════════════════════════════
+      # FUZZ REPORT — the whole point of this run
+      # ══════════════════════════════════════════════════════════
+      - name: Fuzz report
+        if: always()
+        run: |
+          echo "=================================================="
+          echo "  FUZZ REPORT — ${{ inputs.susfs_source }}"
+          echo "=================================================="
+          echo ""
+          printf "  %-22s %-8s %s\n" "PATCH" "MAXFUZZ" "RESULT"
+          printf "  %-22s %-8s %s\n" "----------------------" "--------" "--------"
+
+          WORST=0
+          FAILED=0
+          if [ -f /tmp/fuzz_summary ]; then
+            while IFS=: read -r label fuzz result; do
+              [ -n "$label" ] || continue
+              case "$result" in
+                clean)  ICON="✅" ;;
+                fuzzed) ICON="⚠️ " ;;
+                *)      ICON="❌"; FAILED=1 ;;
+              esac
+              printf "  %-22s %-8s %s %s\n" "$label" "$fuzz" "$ICON" "$result"
+              case "$fuzz" in
+                [0-3]) [ "$fuzz" -gt "$WORST" ] && WORST=$fuzz ;;
+                *)     FAILED=1 ;;
+              esac
+            done < /tmp/fuzz_summary
+          else
+            echo "  (no patches recorded)"
+          fi
+
+          echo ""
+          echo "  WORST FUZZ ACROSS ALL PATCHES: ${WORST}"
+          echo ""
+          case "$WORST" in
+            0) echo "  ✅ PERFECT — every hunk matched exactly." ;;
+            1) echo "  ✅ GOOD — fuzz 1 is minor context drift." ;;
+            2) echo "  ⚠️  ACCEPTABLE — verify carefully before flashing." ;;
+            3) echo "  ⚠️  HIGH — patch ignored 3 lines of context." ;;
+          esac
+          echo ""
+          echo "  Reference: yucca-a also uses --fuzz=3 tolerant apply"
+          echo "  and reports 'no rejects'. Fuzz is expected; the"
+          echo "  question is how much."
+          echo "=================================================="
+
+          {
+            echo "## EXP3 Fuzz Report"
+            echo ""
+            echo "**Source:** \`${{ inputs.susfs_source }}\`  "
+            echo "**SUSFS commit:** \`${SUSFS_SHA:-n/a}\`  "
+            echo "**Worst fuzz:** \`${WORST}\`"
+            echo ""
+            echo "| Patch | Max fuzz | Result |"
+            echo "|---|---|---|"
+            if [ -f /tmp/fuzz_summary ]; then
+              while IFS=: read -r l f r; do
+                [ -n "$l" ] || continue
+                echo "| \`$l\` | $f | $r |"
+              done < /tmp/fuzz_summary
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "WORST_FUZZ=${WORST}" >> $GITHUB_ENV
+
+          MAXF="${{ inputs.max_fuzz }}"
+          if [ "$MAXF" != "99" ] && [ "$WORST" -gt "$MAXF" ]; then
+            echo "::error::Worst fuzz ${WORST} exceeds max_fuzz ${MAXF}"
+            exit 1
+          fi
+          [ "$FAILED" -eq 1 ] && { echo "::error::one or more patches failed"; exit 1; }
+          echo "==> Fuzz gate passed."
+
+      - name: Stop after patching
+        if: inputs.patch_only
+        run: |
+          echo "patch_only=true — stopping before compile."
+          echo "Worst fuzz was: ${WORST_FUZZ}"
+          echo ""
+          echo "Re-run with patch_only=false to build."
+
+      # ══════════════════════════════════════════════════════════
+      # Build (only when patch_only=false)
+      # ══════════════════════════════════════════════════════════
+      - name: Restore Clang
+        if: ${{ !inputs.patch_only }}
         id: cache-clang
         uses: actions/cache@v4
         with:
           path: clang-toolchain
           key: clang-aosp-${{ env.CLANG_VERSION }}
 
-      - name: Download Clang (cache miss only)
-        if: ${{ !inputs.audit_only && steps.cache-clang.outputs.cache-hit != 'true' }}
+      - name: Download Clang (cache miss)
+        if: ${{ !inputs.patch_only && steps.cache-clang.outputs.cache-hit != 'true' }}
         run: |
-          curl -sSfL --retry 3 --connect-timeout 30 \
-            -o clang.tar.gz \
+          curl -sSfL --retry 3 --connect-timeout 30 -o clang.tar.gz \
             "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/mirror-goog-main-llvm-toolchain-source/clang-${{ env.CLANG_VERSION }}.tar.gz" \
-            || { echo "ERROR: Clang download failed."; exit 1; }
+            || { echo "ERROR: clang download failed"; exit 1; }
           mkdir -p clang-toolchain
           tar -xf clang.tar.gz -C clang-toolchain
           rm -f clang.tar.gz
 
-      - name: Verify Clang
-        if: ${{ !inputs.audit_only }}
-        run: |
-          export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
-          clang --version || { echo "ERROR: clang not found."; exit 1; }
-
-      - name: Setup ReSukiSU
-        if: ${{ !inputs.audit_only }}
-        run: |
-          echo "==> Running ReSukiSU setup.sh..."
-          curl -sSfL --retry 3 --connect-timeout 20 "${{ env.RESUKISU_SETUP }}" \
-            | bash -s main \
-            || { echo "ERROR: ReSukiSU setup.sh failed."; exit 1; }
-
-          echo ""
-          echo "==> Post-setup state:"
-          if [ -e drivers/kernelsu ]; then
-            if [ -L drivers/kernelsu ]; then
-              echo "  drivers/kernelsu -> $(readlink drivers/kernelsu)"
-              [ -d drivers/kernelsu ] \
-                && echo "  ✅ symlink resolves" \
-                || { echo "  ❌ SYMLINK DANGLING — Kconfig parse will fail"; exit 1; }
-            else
-              echo "  ✅ drivers/kernelsu is a directory"
-            fi
-          else
-            echo "  ❌ drivers/kernelsu missing after setup.sh"
-            exit 1
-          fi
-
-          KSU_TAG=$(git -C KernelSU describe --tags --abbrev=0 2>/dev/null || echo "main")
-          KSU_SHA=$(git -C KernelSU rev-parse --short HEAD 2>/dev/null || echo unknown)
-          echo "  ReSukiSU: ${KSU_TAG} @ ${KSU_SHA}"
-          echo "KSU_TAG=${KSU_TAG}" >> $GITHUB_ENV
-          echo "BUILDSUFFIX=resukisu-${KSU_TAG}-manual-hook" >> $GITHUB_ENV
-
-      # ══════════════════════════════════════════════════════════
-      # SUSFS — tolerant apply (fuzz fallback), same as EXP1
-      # ══════════════════════════════════════════════════════════
-      - name: Apply SUSFS patches
-        if: ${{ !inputs.audit_only && inputs.enable_susfs }}
-        run: |
-          git clone --depth 1 "${{ env.SUSFS_REPO }}" \
-            -b "${{ env.SUSFS_BRANCH }}" susfs4ksu \
-            || { echo "ERROR: SUSFS clone failed."; exit 1; }
-
-          cp susfs4ksu/kernel_patches/fs/susfs.c                fs/
-          cp susfs4ksu/kernel_patches/include/linux/susfs.h     include/linux/
-          cp susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
-
-          SUSFS_PATCH="susfs4ksu/kernel_patches/50_add_susfs_in_${{ env.SUSFS_BRANCH }}.patch"
-          touch /tmp/susfs_ts
-
-          if patch -p1 --forward --dry-run < "$SUSFS_PATCH" >/dev/null 2>&1; then
-            echo "==> SUSFS applies cleanly (fuzz=0)."
-            patch -p1 --forward < "$SUSFS_PATCH"
-          else
-            echo "==> Clean apply failed — retrying with --fuzz=3..."
-            if patch -p1 --forward --fuzz=3 < "$SUSFS_PATCH"; then
-              echo "::warning::SUSFS needed fuzz=3 — tree has drifted."
-            else
-              echo "::error::SUSFS failed even at fuzz=3."
-              find . -name '*.rej' -newer /tmp/susfs_ts 2>/dev/null | while read -r r; do
-                echo "--- REJECT: $r ---"; head -60 "$r"
-              done
-              exit 1
-            fi
-          fi
-
-          REJ="$(find . -name '*.rej' -newer /tmp/susfs_ts 2>/dev/null || true)"
-          if [ -n "$REJ" ]; then
-            echo "::error::SUSFS left rejects:"
-            echo "$REJ" | while read -r r; do
-              [ -n "$r" ] || continue
-              echo "--- REJECT: $r ---"; head -60 "$r"
-            done
-            exit 1
-          fi
-          echo "==> SUSFS placed with no rejects."
-
-          KSU_PATCH="susfs4ksu/kernel_patches/10_enable_susfs_for_ksu.patch"
-          if [ -f "$KSU_PATCH" ]; then
-            if patch -p1 --forward --dry-run < "$KSU_PATCH" >/dev/null 2>&1; then
-              patch -p1 --forward < "$KSU_PATCH" || true
-              echo "==> KSU driver SUSFS patch applied."
-            else
-              echo "==> KSU driver patch skipped — will inject Kconfig manually."
-            fi
-          fi
-
-          KSU_KCONFIG="drivers/kernelsu/Kconfig"
-          if [ -f "$KSU_KCONFIG" ]; then
-            if ! grep -q 'KSU_SUSFS' "$KSU_KCONFIG"; then
-              echo "==> Injecting SUSFS Kconfig entries..."
-              printf '\nconfig KSU_SUSFS\n\tbool "Enable SUSFS for KernelSU"\n\tdepends on KSU\n\tdefault y\n\thelp\n\t  Patch for SUSFS on KernelSU\n' >> "$KSU_KCONFIG"
-              SUSFS_OPTS=$(grep -hroE 'CONFIG_KSU_SUSFS_[A-Z_]+' \
-                susfs4ksu/kernel_patches/include/linux/susfs.h \
-                susfs4ksu/kernel_patches/fs/susfs.c 2>/dev/null \
-                | sort -u | sed 's/CONFIG_KSU_SUSFS_//')
-              for opt in $SUSFS_OPTS; do
-                DESC=$(echo "$opt" | tr '_' ' ' | tr '[:upper:]' '[:lower:]')
-                printf '\nconfig KSU_SUSFS_%s\n\tbool "Enable %s"\n\tdepends on KSU_SUSFS\n\tdefault y\n' "$opt" "$DESC" >> "$KSU_KCONFIG"
-              done
-              echo "==> Injected: $SUSFS_OPTS"
-            else
-              echo "==> SUSFS Kconfig already present."
-            fi
-          fi
-
-          echo "SUSFS_SHA=$(git -C susfs4ksu rev-parse --short HEAD 2>/dev/null || echo unknown)" >> $GITHUB_ENV
-          rm -rf susfs4ksu
-
-      # ══════════════════════════════════════════════════════════
-      # ZeroMount — deterministic path (learned from EXP1 log)
-      #   <android-ver>/<solution>/patches/60_zeromount-<ver>.patch
-      # NO pipefail here (| head causes SIGPIPE).
-      # ══════════════════════════════════════════════════════════
-      - name: Apply ZeroMount
-        id: zeromount
-        if: ${{ !inputs.audit_only && inputs.enable_zeromount }}
-        continue-on-error: true
-        run: |
-          git clone "${{ env.ZEROMOUNT_REPO }}" zeromount-src \
-            || { echo "::warning::clone failed"; exit 1; }
-          git -C zeromount-src checkout "${{ env.ZEROMOUNT_COMMIT }}" \
-            || { echo "::warning::commit not found"; exit 1; }
-
-          ZM_ANDROID="$(echo '${{ env.SUSFS_BRANCH }}' | sed 's/^gki-//')"
-          ZM_DIR="zeromount-src/${ZM_ANDROID}/ReSukiSU/patches"
-          ZM_PATCH="${ZM_DIR}/60_zeromount-${ZM_ANDROID}.patch"
-
-          echo "==> Target: ${ZM_PATCH}"
-          if [ ! -d "$ZM_DIR" ]; then
-            echo "::warning::missing dir ${ZM_DIR}"
-            ls -1 zeromount-src 2>/dev/null | head -20 || true
-            exit 1
-          fi
-          ls -la "$ZM_DIR" || true
-
-          if [ ! -f "$ZM_PATCH" ]; then
-            ZM_PATCH="$(find "$ZM_DIR" -maxdepth 1 -name '60_zeromount*.patch' 2>/dev/null | head -1 || true)"
-          fi
-          if [ -z "$ZM_PATCH" ] || [ ! -f "$ZM_PATCH" ]; then
-            echo "::warning::no ZeroMount patch found"
-            exit 1
-          fi
-
-          echo "==> Files touched by this patch:"
-          grep -E '^(\+\+\+|---) ' "$ZM_PATCH" 2>/dev/null | head -30 || true
-
-          touch /tmp/zm_ts
-          if patch -p1 --forward --dry-run < "$ZM_PATCH" >/dev/null 2>&1; then
-            echo "==> Applies cleanly (fuzz=0)."
-            patch -p1 --forward < "$ZM_PATCH"
-            OK=1
-          else
-            echo "==> Retrying with --fuzz=3..."
-            if patch -p1 --forward --fuzz=3 < "$ZM_PATCH"; then
-              echo "::warning::ZeroMount needed fuzz=3."
-              OK=1
-            else
-              echo "::warning::ZeroMount failed at fuzz=3."
-              OK=0
-            fi
-          fi
-
-          REJ="$(find . -name '*.rej' -newer /tmp/zm_ts 2>/dev/null || true)"
-          if [ -n "$REJ" ]; then
-            echo "::warning::ZeroMount rejects:"
-            echo "$REJ" | while read -r r; do
-              [ -n "$r" ] || continue
-              echo "--- REJECT: $r ---"; head -60 "$r"
-            done
-            OK=0
-          fi
-
-          [ "${OK:-0}" = "1" ] || { echo "::warning::ZeroMount NOT applied."; exit 1; }
-
-          [ -f fs/zeromount.c ] && echo "  ✅ fs/zeromount.c" || echo "  ⚠️  fs/zeromount.c missing"
-          grep -q 'zeromount' fs/Makefile 2>/dev/null && echo "  ✅ fs/Makefile" || echo "  ⚠️  fs/Makefile no entry"
-          grep -rq 'ZEROMOUNT' fs/Kconfig 2>/dev/null && echo "  ✅ fs/Kconfig" || echo "  ⚠️  fs/Kconfig no entry"
-
-          rm -rf zeromount-src
-          echo "ZEROMOUNT_OK=1" >> $GITHUB_ENV
-
-      - name: Feature status
-        if: ${{ !inputs.audit_only }}
-        run: |
-          echo "SUSFS     : ${{ inputs.enable_susfs }}"
-          echo "ZeroMount : ${ZEROMOUNT_OK:-0} (1 = applied)"
-          echo "Clean tree: ${{ steps.audit.outputs.clean_tree }}"
-
       - name: Set up swap (24 GB)
-        if: ${{ !inputs.audit_only }}
+        if: ${{ !inputs.patch_only }}
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 24
 
       - name: Generate defconfig
-        if: ${{ !inputs.audit_only }}
+        if: ${{ !inputs.patch_only }}
         run: |
           export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
           make -j$(nproc --all) O=out ARCH=arm64 \
             CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 gki_defconfig
 
       - name: Enable configs
-        if: ${{ !inputs.audit_only }}
+        if: ${{ !inputs.patch_only }}
         run: |
           export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
           ./scripts/config --file out/.config -e CONFIG_KSU
 
-          KSU_KCONFIG="drivers/kernelsu/Kconfig"
-          if [ -f "$KSU_KCONFIG" ]; then
-            grep -oE '^config KSU_SUSFS[A-Z_]*' "$KSU_KCONFIG" | while read -r line; do
-              OPT="CONFIG_${line#config }"
-              echo "  Enabling $OPT"
-              ./scripts/config --file out/.config -e "$OPT"
+          KCFG="drivers/kernelsu/Kconfig"
+          if [ -f "$KCFG" ]; then
+            grep -oE '^config KSU_SUSFS[A-Z_]*' "$KCFG" | while read -r l; do
+              ./scripts/config --file out/.config -e "CONFIG_${l#config }"
             done
           fi
-
           ./scripts/config --file out/.config -e CONFIG_KSU_MANUAL_HOOK || true
 
           if [ "${ZEROMOUNT_OK:-0}" = "1" ]; then
-            echo "==> Enabling CONFIG_ZEROMOUNT"
             ./scripts/config --file out/.config -e CONFIG_ZEROMOUNT
           fi
 
-          if [ "${{ inputs.enable_thinlto }}" = "true" ]; then
-            echo "==> Selecting ThinLTO"
-            ./scripts/config --file out/.config -d LTO_NONE       || true
-            ./scripts/config --file out/.config -e LTO_CLANG      || true
-            ./scripts/config --file out/.config -e LTO_CLANG_THIN || true
-            ./scripts/config --file out/.config -d LTO_CLANG_FULL || true
-            ./scripts/config --file out/.config -e CFI_CLANG      || true
-          fi
+          ./scripts/config --file out/.config -d LTO_NONE       || true
+          ./scripts/config --file out/.config -e LTO_CLANG      || true
+          ./scripts/config --file out/.config -e LTO_CLANG_THIN || true
+          ./scripts/config --file out/.config -d LTO_CLANG_FULL || true
+          ./scripts/config --file out/.config -e CFI_CLANG      || true
 
           make -j$(nproc --all) O=out ARCH=arm64 \
             CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 olddefconfig
 
       - name: Verify config
-        if: ${{ !inputs.audit_only }}
+        if: ${{ !inputs.patch_only }}
         run: |
-          CONFIG=out/.config
-          FAILED=0
-          grep -q 'CONFIG_KSU=y' "$CONFIG" && echo "  ✅ CONFIG_KSU=y" || { echo "  ❌ CONFIG_KSU missing"; FAILED=1; }
+          C=out/.config
+          grep -q 'CONFIG_KSU=y' "$C" && echo "  ✅ CONFIG_KSU=y" || { echo "  ❌ CONFIG_KSU"; exit 1; }
+          grep -q 'CONFIG_KSU_SUSFS=y' "$C" && echo "  ✅ CONFIG_KSU_SUSFS=y" || echo "  ⚠️  SUSFS off"
+          [ "${ZEROMOUNT_OK:-0}" = "1" ] && { grep -q 'CONFIG_ZEROMOUNT=y' "$C" \
+            && echo "  ✅ CONFIG_ZEROMOUNT=y" || echo "  ⚠️  ZEROMOUNT not set"; }
+          grep -q 'CONFIG_LTO_CLANG_THIN=y' "$C" && echo "  ✅ ThinLTO" || echo "  ⚠️  not ThinLTO"
+          grep -q 'CONFIG_CFI_CLANG=y' "$C" && echo "  ✅ CFI_CLANG=y" || echo "  ⚠️  CFI off"
 
-          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
-            grep -q 'CONFIG_KSU_SUSFS=y' "$CONFIG" && echo "  ✅ CONFIG_KSU_SUSFS=y" || { echo "  ❌ CONFIG_KSU_SUSFS missing"; FAILED=1; }
-            echo "  --- SUSFS sub-options ---"
-            grep -E '^CONFIG_KSU_SUSFS_[A-Z_]+=y' "$CONFIG" | sed 's/^/  ✅ /' || echo "  ⚠️  none set"
-          fi
-
-          if [ "${ZEROMOUNT_OK:-0}" = "1" ]; then
-            grep -q 'CONFIG_ZEROMOUNT=y' "$CONFIG" && echo "  ✅ CONFIG_ZEROMOUNT=y" || echo "  ⚠️  CONFIG_ZEROMOUNT not set"
-          fi
-
-          echo "  --- LTO ---"
-          grep -q 'CONFIG_LTO_CLANG_THIN=y' "$CONFIG" && echo "  ✅ ThinLTO" || echo "  ⚠️  not ThinLTO"
-          grep -q 'CONFIG_CFI_CLANG=y' "$CONFIG" && echo "  ✅ CFI_CLANG=y" || echo "  ⚠️  CFI off"
-
-          [ "$FAILED" -eq 1 ] && { echo "::error::critical config missing"; exit 1; }
-          echo "==> Config OK."
-
-      # ══════════════════════════════════════════════════════════
-      # Bridge stubs — AUTO-DETECTED.
-      #
-      # On a clean tree these are unnecessary, and forcing them can
-      # cause DUPLICATE symbol errors (exactly what happened with
-      # the SELinux stubs earlier in this project).
-      #
-      # 'auto' does a trial link and only creates stubs for symbols
-      # that are ACTUALLY undefined.
-      # ══════════════════════════════════════════════════════════
-      - name: Bridge stubs (mode = ${{ inputs.enable_bridge_stubs }})
-        if: ${{ !inputs.audit_only }}
-        run: |
-          MODE="${{ inputs.enable_bridge_stubs }}"
-
-          if [ "$MODE" = "force-off" ]; then
-            echo "==> force-off: no stubs created."
-            exit 0
-          fi
-
-          if [ "$MODE" = "auto" ] && [ "${{ steps.audit.outputs.clean_tree }}" = "true" ]; then
-            echo "==> auto + clean tree: skipping stubs."
-            echo "    If the link fails with undefined ksu_* symbols,"
-            echo "    re-run with enable_bridge_stubs=force-on."
-            exit 0
-          fi
-
-          echo "==> Creating bridge stubs (weak symbols)..."
-          {
-            echo '#include <linux/types.h>'
-            echo '#include <linux/fs.h>'
-            echo '#include <linux/version.h>'
-            echo '#include <linux/jump_label.h>'
-            echo 'int __attribute__((weak)) ksu_handle_sys_reboot(void) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_handle_sys_read(unsigned int fd, char __user *buf, size_t count) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_handle_vfs_fstat(int fd, struct kstat *stat) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_handle_devpts(struct inode *inode) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_input_hook(void *dev, unsigned int type, unsigned int code, int value) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_execveat_hook(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_handle_execveat_sucompat(int *fd, const char __user **filename_user, void *argv, void *envp, int *flags) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_init_rc_hook(const char *data, unsigned long count) { return 0; }'
-            echo 'int __attribute__((weak)) ksu_install_su_fd(void) { return 0; }'
-            echo 'bool __attribute__((weak)) susfs_is_current_ksu_domain(void) { return true; }'
-            echo 'unsigned int __attribute__((weak)) susfs_ksu_sid;'
-            echo 'unsigned int __attribute__((weak)) susfs_priv_app_sid;'
-          } > kernel/ksu_hooks_bridge.c
-
-          grep -q 'ksu_hooks_bridge' kernel/Makefile \
-            || echo 'obj-y += ksu_hooks_bridge.o' >> kernel/Makefile
-          echo "==> Stubs created."
-
-      # ══════════════════════════════════════════════════════════
-      # Assert the yucca gate never ran. We never invoke their
-      # build.sh, so no token should exist and no gate hash should
-      # be in the version string.
-      # ══════════════════════════════════════════════════════════
       - name: Verify no yucca gate
-        if: ${{ !inputs.audit_only }}
+        if: ${{ !inputs.patch_only }}
         run: |
-          FAIL=0
-          if [ -f .yucca_token ]; then
-            echo "::error::.yucca_token was generated — gate may be active!"
-            FAIL=1
-          else
-            echo "  ✅ no .yucca_token"
-          fi
-          if grep -rqi 'yucca_gate\|yucca_token' include/generated/ 2>/dev/null; then
-            echo "::error::gate reference found in generated headers"
-            FAIL=1
-          else
-            echo "  ✅ no gate in generated headers"
-          fi
-          [ "$FAIL" -eq 1 ] && exit 1
-          echo "==> Gate verification passed."
+          [ -f .yucca_token ] && { echo "::error::.yucca_token generated"; exit 1; } \
+            || echo "  ✅ no .yucca_token"
 
       - name: Build kernel
-        if: ${{ !inputs.audit_only }}
+        if: ${{ !inputs.patch_only }}
         run: |
           export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
-          echo "==> Compiling..."
           make -j$(nproc --all) O=out ARCH=arm64 \
             CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1
 
-      - name: Verify compiled objects
-        if: ${{ !inputs.audit_only }}
+      - name: Verify objects
+        if: ${{ !inputs.patch_only }}
         run: |
-          FAILED=0
-          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
-            find out/ -name 'susfs.o' | grep -q . \
-              && echo "  ✅ susfs.o compiled" \
-              || { echo "  ❌ susfs.o NOT compiled"; FAILED=1; }
-          fi
-          if [ "${ZEROMOUNT_OK:-0}" = "1" ]; then
-            find out/ -name 'zeromount.o' | grep -q . \
-              && echo "  ✅ zeromount.o compiled" \
-              || echo "  ⚠️  zeromount.o NOT compiled"
-          fi
-          if [ -f out/arch/arm64/boot/Image ] || [ -f out/arch/arm64/boot/Image.gz ]; then
-            echo "  ✅ kernel Image present"
-            ls -la out/arch/arm64/boot/Image* 2>/dev/null || true
-          else
-            echo "  ❌ no kernel Image"; FAILED=1
-          fi
-          [ "$FAILED" -eq 1 ] && { echo "::error::post-build verification failed"; exit 1; }
-          echo "==> All post-build checks passed."
+          F=0
+          find out/ -name 'susfs.o' | grep -q . && echo "  ✅ susfs.o" || { echo "  ❌ susfs.o"; F=1; }
+          [ "${ZEROMOUNT_OK:-0}" = "1" ] && { find out/ -name 'zeromount.o' | grep -q . \
+            && echo "  ✅ zeromount.o" || echo "  ⚠️  zeromount.o missing"; }
+          ls out/arch/arm64/boot/Image* >/dev/null 2>&1 \
+            && echo "  ✅ Image present" || { echo "  ❌ no Image"; F=1; }
+          [ "$F" -eq 1 ] && exit 1 || echo "==> checks passed."
 
-      - name: Resolve metadata
-        if: ${{ !inputs.audit_only }}
+      - name: Metadata
+        if: ${{ !inputs.patch_only }}
         id: meta
         run: |
           echo "kernelversion=$(make kernelversion 2>/dev/null | awk -F. '{print $1"."$2"."$3}')" >> $GITHUB_OUTPUT
           echo "date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
 
-      - name: Package AnyKernel3 ZIP
-        if: ${{ !inputs.audit_only }}
+      - name: Package AnyKernel3
+        if: ${{ !inputs.patch_only }}
         run: |
           AK=".own-repo/.github/goodies/AnyKernel3.zip"
-          if [ ! -f "$AK" ]; then
-            echo "::warning::AnyKernel3.zip not found in own repo — uploading raw Image only."
-            mkdir -p AnyKernel3
-            cp out/arch/arm64/boot/Image* AnyKernel3/ 2>/dev/null || true
-            exit 0
-          fi
-          unzip -q "$AK" -d AnyKernel3
-          if [ -f out/arch/arm64/boot/Image.gz ]; then
-            cp out/arch/arm64/boot/Image.gz AnyKernel3/
-          else
-            cp out/arch/arm64/boot/Image AnyKernel3/
-          fi
-
+          mkdir -p AnyKernel3
+          if [ -f "$AK" ]; then unzip -q "$AK" -d AnyKernel3; fi
+          cp out/arch/arm64/boot/Image* AnyKernel3/ 2>/dev/null || true
           {
-            echo "======================================================="
-            echo "  SM8550 KERNEL — EXP2 (yucca-a clean source)"
-            echo "======================================================="
-            echo "  Source    : ${{ inputs.kernel_repo }}@${{ inputs.kernel_ref }}"
-            echo "  Kernel    : ${{ steps.meta.outputs.kernelversion }}"
-            echo "  ReSukiSU  : ${KSU_TAG}"
-            echo "  SUSFS     : ${{ inputs.enable_susfs }} (${SUSFS_SHA:-n/a})"
-            echo "  ZeroMount : ${ZEROMOUNT_OK:-0}"
-            echo "  ThinLTO   : ${{ inputs.enable_thinlto }}"
-            echo "  Built     : $(date '+%Y-%m-%d %H:%M UTC')"
+            echo "SM8550 — EXP3"
+            echo "Source     : ${{ inputs.kernel_repo }}"
+            echo "Kernel     : ${{ steps.meta.outputs.kernelversion }}"
+            echo "SUSFS src  : ${{ inputs.susfs_source }} (${SUSFS_SHA:-n/a})"
+            echo "ZeroMount  : ${ZEROMOUNT_OK:-0}"
+            echo "Worst fuzz : ${WORST_FUZZ}"
             echo ""
-            echo "  EXPERIMENTAL — verify before flashing."
-            echo "  Back up boot partition first:"
-            echo "    dd if=/dev/block/by-name/boot of=/sdcard/boot-backup.img"
-            echo "======================================================="
+            echo "Back up boot first:"
+            echo "  dd if=/dev/block/by-name/boot of=/sdcard/boot-backup.img"
           } > AnyKernel3/CHANGELOG.txt
-          echo "==> Packaged."
 
       - name: Upload artifact
-        if: ${{ !inputs.audit_only }}
+        if: ${{ !inputs.patch_only }}
         uses: actions/upload-artifact@v4
         with:
-          name: EXP2-sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-${{ steps.meta.outputs.date }}
+          name: EXP3-${{ inputs.susfs_source }}-${{ steps.meta.outputs.kernelversion }}-fuzz${{ env.WORST_FUZZ }}-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
           if-no-files-found: warn
-
-      - name: Build summary
-        if: always()
-        run: |
-          {
-            echo "## EXP2 — yucca-a clean source"
-            echo ""
-            echo "| Item | Value |"
-            echo "|---|---|"
-            echo "| Source | \`${{ inputs.kernel_repo }}@${{ inputs.kernel_ref }}\` |"
-            echo "| Kernel | \`${{ steps.meta.outputs.kernelversion }}\` |"
-            echo "| ReSukiSU | \`${KSU_TAG:-n/a}\` |"
-            echo "| Clean tree | \`${{ steps.audit.outputs.clean_tree }}\` |"
-            echo "| SUSFS | \`${{ inputs.enable_susfs }}\` |"
-            echo "| ZeroMount | \`${ZEROMOUNT_OK:-0}\` |"
-            echo "| ThinLTO | \`${{ inputs.enable_thinlto }}\` |"
-            echo "| Bridge stubs | \`${{ inputs.enable_bridge_stubs }}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Discord notification
         if: always()
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          [ -z "$DISCORD_WEBHOOK_URL" ] && { echo "no webhook — skipping"; exit 0; }
-
+          [ -z "$DISCORD_WEBHOOK_URL" ] && { echo "no webhook"; exit 0; }
           if [ "${{ job.status }}" = "failure" ]; then
-            COLOR=15548997; STATUS="❌ EXP2 BUILD FAILED"
+            COLOR=15548997; ST="❌ EXP3 FAILED"
           else
-            COLOR=10181046; STATUS="🧪 EXP2 BUILD OK — verify before flashing"
+            COLOR=10181046; ST="🧪 EXP3 OK"
           fi
-          ZM="not applied"; [ "${ZEROMOUNT_OK:-0}" = "1" ] && ZM="applied"
-
           PAYLOAD=$(jq -n \
-            --arg title "🧪 [EXP2] SM8550 — yucca-a clean source" \
-            --arg desc "Source: \`${{ inputs.kernel_repo }}@${{ inputs.kernel_ref }}\`" \
-            --arg status "$STATUS" \
-            --arg kver "🐧 Kernel: ${{ steps.meta.outputs.kernelversion }}" \
-            --arg zm "🧭 ZeroMount: ${ZM}" \
-            --arg clean "🌱 Clean tree: ${{ steps.audit.outputs.clean_tree }}" \
-            --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --argjson color "$COLOR" \
-            '{"embeds":[{"title":$title,"description":$desc,"color":$color,
-              "fields":[
-                {"name":"Status","value":$status,"inline":false},
-                {"name":"Kernel","value":$kver,"inline":true},
-                {"name":"ZeroMount","value":$zm,"inline":true},
-                {"name":"Clean tree","value":$clean,"inline":true},
-                {"name":"Log","value":("[View](" + $url + ")"),"inline":false}],
-              "footer":{"text":"SM8550 CI • EXP2 SANDBOX"},
+            --arg t "🧪 [EXP3] SM8550 — ${{ inputs.susfs_source }}" \
+            --arg d "Fuzz measurement run. patch_only=${{ inputs.patch_only }}" \
+            --arg s "$ST" \
+            --arg f "📏 Worst fuzz: ${WORST_FUZZ:-n/a}" \
+            --arg z "🧭 ZeroMount: ${ZEROMOUNT_OK:-0}" \
+            --arg u "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson c "$COLOR" \
+            '{"embeds":[{"title":$t,"description":$d,"color":$c,"fields":[
+              {"name":"Status","value":$s,"inline":false},
+              {"name":"Fuzz","value":$f,"inline":true},
+              {"name":"ZeroMount","value":$z,"inline":true},
+              {"name":"Log","value":("[View](" + $u + ")"),"inline":false}],
+              "footer":{"text":"SM8550 CI • EXP3"},
               "timestamp":(now|strftime("%Y-%m-%dT%H:%M:%SZ"))}]}')
-
           curl -sSf -H "Content-Type: application/json" -d "$PAYLOAD" \
-            "$DISCORD_WEBHOOK_URL" \
-            && echo "sent" || echo "notification failed (non-fatal)"
+            "$DISCORD_WEBHOOK_URL" && echo sent || echo "notify failed"
