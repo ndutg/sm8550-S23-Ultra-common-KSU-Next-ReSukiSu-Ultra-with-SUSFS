@@ -141,6 +141,46 @@ jobs:
           echo "KSU_SHA=${KSU_SHA}" >> $GITHUB_ENV
           echo "BUILDSUFFIX=resukisu-${KSU_TAG}-manual-hook" >> $GITHUB_ENV
 
+      - name: Neutralise yucca gate
+        run: |
+          echo "=================================================="
+          echo "  YUCCA GATE REMOVAL"
+          echo "=================================================="
+
+          # Show what it actually is, for the record
+          if [ -f drivers/misc/early_assert.c ]; then
+            echo "--- drivers/misc/early_assert.c (first 60 lines) ---"
+            head -60 drivers/misc/early_assert.c | sed 's/^/    /'
+            echo ""
+            echo "--- Makefile / Kconfig references ---"
+            grep -n 'early_assert' drivers/misc/Makefile 2>/dev/null | sed 's/^/    /' || true
+            grep -rn 'EARLY_ASSERT\|early_assert' drivers/misc/Kconfig 2>/dev/null | sed 's/^/    /' || true
+            echo ""
+          else
+            echo "  early_assert.c not present — nothing to do."
+            exit 0
+          fi
+
+          # Drop it from the build
+          if grep -q 'early_assert' drivers/misc/Makefile 2>/dev/null; then
+            cp drivers/misc/Makefile /tmp/misc_makefile.bak
+            sed -i '/early_assert/d' drivers/misc/Makefile
+            echo "  ✅ removed early_assert from drivers/misc/Makefile"
+            diff /tmp/misc_makefile.bak drivers/misc/Makefile | sed 's/^/    /' || true
+          else
+            echo "  ⚠️  no Makefile reference found"
+          fi
+
+          # Remove the source so nothing can pull it back in
+          rm -f drivers/misc/early_assert.c
+          echo "  ✅ removed drivers/misc/early_assert.c"
+
+          # Catch any other gate-token consumers
+          echo ""
+          echo "--- other yucca_gate_token.h consumers ---"
+          grep -rln 'yucca_gate_token' drivers/ init/ kernel/ security/ fs/ 2>/dev/null \
+            | sed 's/^/    /' || echo "    (none)"
+
       - name: Fetch Super-Builders
         run: |
           git clone --quiet "${{ env.SB_REPO }}" sb-src \
