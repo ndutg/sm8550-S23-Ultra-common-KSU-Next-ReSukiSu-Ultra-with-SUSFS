@@ -208,6 +208,18 @@ jobs:
           echo "  these patches predate the SUSFS static_key rename and"
           echo "  need a contemporaneous ReSukiSU."
           echo "=================================================="
+          echo ""
+          echo "--- [5] resukisu-pin.txt (THE ANSWER) ---"
+          PINF="sb-src/${{ env.ANDROID_VER }}/resukisu-pin.txt"
+          if [ -f "$PINF" ]; then
+            echo "  file   : $PINF"
+            echo "  content: $(cat "$PINF")"
+            echo ""
+            echo "  ==> Set resukisu_ref to this value."
+          else
+            echo "  (not present — they track the susfs-ksud branch head)"
+            ls -la "sb-src/${{ env.ANDROID_VER }}/" | sed 's/^/    /'
+          fi
 
       - name: Setup ReSukiSU
         run: |
