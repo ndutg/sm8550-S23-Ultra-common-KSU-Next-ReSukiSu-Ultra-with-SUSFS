@@ -10,17 +10,16 @@ on:
           - resukisu
           - lkm
         default: resukisu
-      jobs:
-        description: "Parallel make jobs (blank = nproc)"
-        type: string
-        default: ""
+      pack_zip:
+        description: "Pack AnyKernel3 zip (needs AnyKernel3 source)"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 env:
-  # GNU tar reads this — silences the thousands of macOS xattr warnings
-  # ('LIBARCHIVE.xattr.com.apple.quarantine') that flooded previous runs.
+  # Silences ~29,000 macOS xattr warnings from the toolchain tarball.
   TAR_OPTIONS: "--warning=no-unknown-keyword"
 
 jobs:
@@ -31,28 +30,17 @@ jobs:
 
     steps:
 
-      # ════════════════════════════════════════════════════════════
-      # Free disk BEFORE checkout — the toolchain is ~2.2 GB
-      # compressed and expands to roughly 8-10 GB.
-      # ════════════════════════════════════════════════════════════
       - name: Free up disk space
         run: |
           echo "==> Disk before cleanup:"
           df -h /
-          echo ""
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /usr/local/lib/android || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /usr/local/share/boost || true
-          sudo rm -rf /usr/local/.ghcup || true
-          sudo rm -rf /usr/share/swift || true
-          sudo rm -rf /usr/local/share/powershell || true
-          sudo rm -rf /usr/local/share/chromium || true
-          sudo rm -rf /usr/local/lib/node_modules || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost /usr/local/.ghcup || true
+          sudo rm -rf /usr/share/swift /usr/local/share/powershell || true
+          sudo rm -rf /usr/local/share/chromium /usr/local/lib/node_modules || true
           sudo rm -rf "${AGENT_TOOLSDIRECTORY}" || true
           sudo docker image prune --all --force || true
           sudo apt-get clean || true
-          echo ""
           echo "==> Disk after cleanup:"
           df -h /
 
@@ -62,6 +50,40 @@ jobs:
           repository: yucca-a/kernel_samsung_sm8550
           ref: main
           fetch-depth: 1
+
+      # ════════════════════════════════════════════════════════════
+      # yucca-a does NOT ship an anykernel3/ tree. Pull the known-good
+      # AnyKernel3.zip from your own repo and stage it so the build
+      # script's pack step can find it.
+      # ════════════════════════════════════════════════════════════
+      - name: Checkout own repo (for AnyKernel3)
+        if: inputs.pack_zip
+        uses: actions/checkout@v4
+        with:
+          repository: ndutg/sm8550-S23-Ultra-common-KSU-Next-ReSukiSu-Ultra-with-SUSFS
+          ref: android13-5.15
+          fetch-depth: 1
+          path: .own-repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage AnyKernel3 tree
+        if: inputs.pack_zip
+        run: |
+          AK_ZIP=".own-repo/.github/goodies/AnyKernel3.zip"
+          if [ -f "$AK_ZIP" ]; then
+            echo "==> Found $AK_ZIP — extracting to ./anykernel3"
+            mkdir -p anykernel3
+            unzip -q "$AK_ZIP" -d anykernel3
+            echo "ANYKERNEL_DIR=${GITHUB_WORKSPACE}/anykernel3" >> $GITHUB_ENV
+            ls -la anykernel3/
+          else
+            echo "::warning::AnyKernel3.zip not found — will build Image only."
+            echo "ZIP_AFTER=0" >> $GITHUB_ENV
+          fi
+
+      - name: Skip zip packing
+        if: ${{ !inputs.pack_zip }}
+        run: echo "ZIP_AFTER=0" >> $GITHUB_ENV
 
       - name: Install build dependencies
         run: |
@@ -73,81 +95,47 @@ jobs:
             python3 python-is-python3 tar perl lz4 jq \
             ccache rsync
 
-      # ════════════════════════════════════════════════════════════
-      # Swap reduced from 24 GB to 8 GB. The swapfile consumes real
-      # disk, and 24 GB left too little room for the toolchain.
-      # ════════════════════════════════════════════════════════════
       - name: Set up swap (8 GB)
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 8
 
-      - name: Show repo layout and environment
+      - name: Show environment
         run: |
           echo "==> Kernel version:"
           make kernelversion 2>/dev/null || head -5 Makefile
           echo ""
-          echo "==> .kernel_build_mode marker:"
-          cat .kernel_build_mode 2>/dev/null || echo "(not found)"
+          echo "==> Build mode marker: $(cat .kernel_build_mode 2>/dev/null || echo none)"
+          echo "==> ANYKERNEL_DIR: ${ANYKERNEL_DIR:-<unset>}"
+          echo "==> ZIP_AFTER: ${ZIP_AFTER:-<unset>}"
           echo ""
-          echo "==> scripts/build/ contents:"
-          ls -la scripts/build/ 2>/dev/null || echo "(scripts/build not found)"
-          echo ""
-          echo "==> CPU / memory:"
-          nproc
-          free -h
-          echo ""
-          echo "==> Disk before build:"
-          df -h /
+          nproc && free -h && df -h /
 
       - name: Build kernel (${{ inputs.mode }})
-        env:
-          JOBS: ${{ inputs.jobs }}
         run: |
           set -o pipefail
           chmod +x scripts/build/*.sh
-
-          # Only export JOBS if the user supplied a value, otherwise
-          # let the build script default to nproc.
-          if [ -n "${JOBS}" ]; then
-            echo "==> Using JOBS=${JOBS}"
-            export JOBS
-          else
-            unset JOBS
-            echo "==> Using default JOBS (nproc = $(nproc))"
-          fi
-
           ./scripts/build/build.sh "${{ inputs.mode }}"
-
-      - name: Disk usage after build
-        if: always()
-        run: |
-          echo "==> Disk after build:"
-          df -h /
-          echo ""
-          echo "==> Largest directories in workspace:"
-          du -h --max-depth=2 . 2>/dev/null | sort -hr | head -20 || true
 
       - name: List build output
         if: always()
         run: |
-          echo "==> Searching for build artifacts..."
-          if [ -d out/ ]; then
-            find out/ -maxdepth 4 -type f \
-              \( -name "*.zip" -o -name "Image" -o -name "Image.gz" \) \
-              2>/dev/null || echo "(no matching artifacts)"
-          else
-            echo "(out/ directory does not exist)"
-          fi
+          echo "==> Artifacts:"
+          find out/ -maxdepth 4 -type f \
+            \( -name "*.zip" -o -name "Image" -o -name "Image.gz" \) 2>/dev/null \
+            || echo "(none)"
+          echo ""
+          echo "==> Disk after build:"
+          df -h /
 
       - name: Upload artifact
-        if: success()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: yucca-${{ inputs.mode }}-${{ github.run_id }}
           path: |
             out/${{ inputs.mode }}/**/*.zip
-            out/${{ inputs.mode }}/**/Image
-            out/${{ inputs.mode }}/**/Image.gz
+            out/${{ inputs.mode }}/arch/arm64/boot/Image
+            out/${{ inputs.mode }}/arch/arm64/boot/Image.gz
           compression-level: 9
           if-no-files-found: warn
