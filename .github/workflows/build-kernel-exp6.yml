@@ -1,4 +1,4 @@
-name: "[EXP7] SM8550 - pinned ReSukiSU + Super-Builders"
+name: "[EXP7.1] SM8550 - pinned ReSukiSU + Super-Builders"
 
 on:
   workflow_dispatch:
@@ -34,7 +34,7 @@ env:
 
 jobs:
   build:
-    name: "EXP7 ReSukiSU ${{ inputs.resukisu_pin }}"
+    name: "EXP7.1 ReSukiSU ${{ inputs.resukisu_pin }}"
     runs-on: ubuntu-24.04
     timeout-minutes: 340
 
@@ -104,10 +104,11 @@ jobs:
 
       - name: Setup and pin ReSukiSU exactly like Super-Builders
         run: |
-          # Super-Builders invokes setup.sh with the susfs-ksud branch,
-          # then checks out the SHA from resukisu-pin.txt.
+          # setup.sh may not expose the historical susfs-ksud branch anymore.
+          # Use main only to create the integration, then detach to the exact
+          # SHA from Super-Builders resukisu-pin.txt.
           curl -sSfL --retry 3 --connect-timeout 20 "${RESUKISU_SETUP}" \
-            | bash -s susfs-ksud
+            | bash -s main
 
           test -d KernelSU/.git || { echo "ERROR: KernelSU repo was not created"; exit 1; }
 
@@ -225,9 +226,9 @@ jobs:
           apply_patch 50_susfs "$P50" "$ROOT" || exit 1
           apply_patch 51_enhanced "$P51" "$ROOT" || exit 1
 
-          # At the pinned revision this patch should target the original
-          # drivers/kernelsu/supercalls.c layout, so use the real patch.
-          apply_patch 70_ksu_safety "$P70" "$ROOT" || exit 1
+          # 70_ contains kernel/supercalls.c relative to the KernelSU repository,
+          # so it must be applied from ${ROOT}/KernelSU rather than the kernel root.
+          apply_patch 70_ksu_safety "$P70" "${ROOT}/KernelSU" || exit 1
           echo "KSU_SAFETY_OK=1" >> "$GITHUB_ENV"
 
           apply_patch 60_zeromount "$P60" "$ROOT" || exit 1
@@ -454,7 +455,7 @@ jobs:
           if [ -f "$AK" ]; then unzip -q "$AK" -d AnyKernel3; fi
           cp out/arch/arm64/boot/Image* AnyKernel3/
           cat > AnyKernel3/CHANGELOG.txt <<EOF
-          SM8550 EXP7
+          SM8550 EXP7.1
           Kernel: ${{ steps.meta.outputs.kernelversion }}
           Kernel source: ${KERNEL_REPO}@${KERNEL_REF}
           ReSukiSU pin: ${{ inputs.resukisu_pin }} (${KSU_SHA})
@@ -468,7 +469,7 @@ jobs:
         if: ${{ !inputs.patch_only }}
         uses: actions/upload-artifact@v4
         with:
-          name: EXP7-sm8550-${{ steps.meta.outputs.kernelversion }}-ksu${{ env.KSU_SHA }}-fuzz${{ env.WORST_FUZZ }}-${{ steps.meta.outputs.date }}
+          name: EXP7.1-sm8550-${{ steps.meta.outputs.kernelversion }}-ksu${{ env.KSU_SHA }}-fuzz${{ env.WORST_FUZZ }}-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
           if-no-files-found: error
@@ -477,7 +478,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "## EXP7 pinned build"
+            echo "## EXP7.1 pinned build"
             echo ""
             echo "- Kernel source: \`${KERNEL_REPO}@${KERNEL_REF}\`"
             echo "- Requested ReSukiSU pin: \`${{ inputs.resukisu_pin }}\`"
