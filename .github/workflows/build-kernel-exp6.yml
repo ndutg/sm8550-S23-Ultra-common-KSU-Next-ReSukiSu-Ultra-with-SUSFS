@@ -1,0 +1,889 @@
+name: "[EXP6] SM8550 — version-matched ReSukiSU + Super-Builders"
+
+# ══════════════════════════════════════════════════════════════════
+#  COMPLETE STANDALONE WORKFLOW — supersedes EXP5.
+#  Drop in as .github/workflows/build-kernel-exp6.yml
+#
+#  ── WHY THIS EXISTS ──────────────────────────────────────────────
+#  EXP5 passed the patch gate cleanly (50/51/60/70_native all applied,
+#  yucca gate removed) and compiled for ~6 minutes before ReSukiSU's
+#  own build-time guard stopped it:
+#
+#    -- ReSukiSU: using SuSFS Inline hook
+#    -- ksu_input_hook is incompatible hook
+#    inline_hook_check.mk:31: *** You should integrate ReSukiSU
+#       in your kernel correctly.  Stop.
+#
+#  That is NOT a bug — it is a deliberate rejection. ReSukiSU's
+#  check_ksu_hook_incompatible errors when it finds the OLD hook
+#  name. Upstream SUSFS replaced the bool check with a static_key,
+#  renaming ksu_input_hook -> ksu_handle_input_handle_event.
+#
+#  ROOT CAUSE — we pinned the patches but floated KernelSU:
+#    Super-Builders : pinned c2cb716  (~5 months old)
+#    ReSukiSU       : `setup.sh main` -> today's HEAD (v4.2.0-rc2)
+#
+#  Super-Builders' patchset was authored against the ReSukiSU of 5
+#  months ago. The same asymmetry explains the 70_ dispatcher move
+#  (supercalls.c -> supercall/dispatch.c) seen earlier.
+#
+#  Hand-porting the input hook would only surface the next one:
+#  the same makefile also rejects ksu_vfs_read_hook,
+#  ksu_execveat_hook and ksu_init_rc_hook (x2).
+#
+#  ── WHAT THIS ADDS vs EXP5 ───────────────────────────────────────
+#  1. `resukisu_ref` input  — pin KSU to a revision contemporary
+#     with the Super-Builders commit. Default "main" reproduces the
+#     EXP5 failure exactly, so the change is opt-in.
+#  2. "Discover ReSukiSU version" step — inspects Super-Builders' own
+#     CI to find which KSU ref THEY build against, prints the hook
+#     style actually present in 50_, and dumps SB's commit date.
+#     Runs BEFORE any patching so `patch_only=true` answers the
+#     question in ~3 min instead of a 6-min compile.
+#  3. Pre-compile hook audit — greps for every symbol
+#     inline_hook_check.mk rejects or requires, so we see ALL
+#     mismatches at once rather than one per build.
+#
+#  Isolation: workflow_dispatch only, exp6-* caches, EXP6-* artifacts.
+# ══════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Kernel source repo"
+        type: string
+        default: "yucca-a/kernel_samsung_sm8550"
+      resukisu_ref:
+        description: "ReSukiSU branch/tag/SHA ('main' = floating HEAD)"
+        type: string
+        default: "main"
+      apply_51:
+        description: "Apply 51_enhanced_susfs"
+        type: boolean
+        default: true
+      apply_60:
+        description: "Apply 60_zeromount"
+        type: boolean
+        default: true
+      apply_70:
+        description: "Native port of 70_ksu_safety hunk 2"
+        type: boolean
+        default: true
+      max_fuzz:
+        description: "Fail if any hunk exceeds this fuzz (0-3, 99 = never)"
+        type: string
+        default: "99"
+      patch_only:
+        description: "Discover + patch + report, then STOP (no compile)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  OWN_REPO: ndutg/sm8550-S23-Ultra-common-KSU-Next-ReSukiSu-Ultra-with-SUSFS
+  OWN_REF: android13-5.15
+  ANDROID_VER: android13-5.15
+  CLANG_VERSION: r584948
+  SB_REPO: https://github.com/Enginex0/Super-Builders.git
+  SB_COMMIT: c2cb71614868fe742cbffee2b6f3126523432673
+  RESUKISU_SETUP: https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+
+  build:
+    name: "EXP6 ksu=${{ inputs.resukisu_ref }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+
+    steps:
+
+      - name: Free up disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost /usr/local/.ghcup || true
+          sudo rm -rf /usr/share/swift /usr/local/share/powershell || true
+          sudo rm -rf /usr/local/share/chromium /usr/local/lib/node_modules || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY}" || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_repo }}
+          ref: main
+          fetch-depth: 1
+
+      - name: Checkout own repo (AnyKernel3)
+        if: ${{ !inputs.patch_only }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.OWN_REPO }}
+          ref: ${{ env.OWN_REF }}
+          fetch-depth: 1
+          path: .own-repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential curl flex \
+            g++-multilib gcc-multilib git gnupg \
+            libelf-dev liblz4-tool libssl-dev \
+            lzop zlib1g-dev pahole dwarves cpio zip unzip \
+            python3 python-is-python3 tar perl lz4 jq ccache rsync
+
+      # ══════════════════════════════════════════════════════════
+      #  Fetch Super-Builders FIRST so we can inspect their CI
+      #  before deciding anything about ReSukiSU.
+      # ══════════════════════════════════════════════════════════
+      - name: Fetch Super-Builders
+        run: |
+          git clone --quiet "${{ env.SB_REPO }}" sb-src \
+            || { echo "ERROR: clone failed"; exit 1; }
+          git -C sb-src checkout --quiet "${{ env.SB_COMMIT }}" \
+            || { echo "ERROR: commit not found"; exit 1; }
+          SB_DIR="sb-src/${{ env.ANDROID_VER }}/ReSukiSU/patches"
+          echo "SB_DIR=${SB_DIR}" >> $GITHUB_ENV
+          echo ""
+          echo "Patch set in ${SB_DIR}:"
+          ls -la "$SB_DIR" || { echo "ERROR: dir missing"; exit 1; }
+
+      # ══════════════════════════════════════════════════════════
+      #  DISCOVERY — answers "which ReSukiSU do these patches want?"
+      #  Read-only. Never fails the build.
+      # ══════════════════════════════════════════════════════════
+      - name: Discover ReSukiSU version Super-Builders targets
+        run: |
+          echo "=================================================="
+          echo "  RESUKISU VERSION DISCOVERY"
+          echo "=================================================="
+
+          echo ""
+          echo "--- [1] Pinned Super-Builders commit ---"
+          git -C sb-src log -1 --format='  %H%n  date:    %ci%n  subject: %s'
+
+          echo ""
+          echo "--- [2] KSU refs in Super-Builders CI workflows ---"
+          if [ -d sb-src/.github/workflows ]; then
+            grep -rniE 'resukisu|kernelsu|setup\.sh|ksu[-_]?(ref|tag|version|commit|branch)' \
+              sb-src/.github/workflows/ 2>/dev/null | head -50 | sed 's/^/  /' \
+              || echo "  (no matches)"
+          else
+            echo "  (no .github/workflows in Super-Builders)"
+          fi
+
+          echo ""
+          echo "--- [3] Any pinned SHA / tag anywhere in repo config ---"
+          grep -rniE 'ReSukiSU/ReSukiSU|bash -s +[a-z0-9._-]+' \
+            sb-src/.github sb-src/*.json 2>/dev/null | head -30 | sed 's/^/  /' \
+            || echo "  (none)"
+
+          echo ""
+          echo "--- [4] Hook style present in 50_ patch ---"
+          P50="${SB_DIR}/50_add_susfs_in_gki-${{ env.ANDROID_VER }}.patch"
+          for sym in ksu_input_hook ksu_handle_input_handle_event \
+                     ksu_vfs_read_hook ksu_handle_sys_read \
+                     ksu_execveat_hook ksu_handle_execveat \
+                     ksu_init_rc_hook; do
+            n="$(grep -c -- "$sym" "$P50" 2>/dev/null || true)"
+            n="$(printf '%s' "$n" | head -1 | tr -cd '0-9')"
+            [ -n "$n" ] || n=0
+            printf "  %-36s %s\n" "$sym" "$n"
+          done
+
+          echo ""
+          echo "  NOTE: ReSukiSU's inline_hook_check.mk REJECTS the old"
+          echo "  names (ksu_input_hook, ksu_vfs_read_hook,"
+          echo "  ksu_execveat_hook, ksu_init_rc_hook) and REQUIRES the"
+          echo "  new ones (ksu_handle_*). If the old names appear above,"
+          echo "  these patches predate the SUSFS static_key rename and"
+          echo "  need a contemporaneous ReSukiSU."
+          echo "=================================================="
+
+      - name: Setup ReSukiSU
+        run: |
+          echo "==> Requesting ReSukiSU ref: ${{ inputs.resukisu_ref }}"
+          curl -sSfL --retry 3 --connect-timeout 20 "${{ env.RESUKISU_SETUP }}" \
+            | bash -s "${{ inputs.resukisu_ref }}" \
+            || { echo "ERROR: setup.sh failed"; exit 1; }
+
+          if [ -L drivers/kernelsu ]; then
+            echo "  drivers/kernelsu -> $(readlink drivers/kernelsu)"
+            if [ -d drivers/kernelsu ]; then
+              echo "  ✅ symlink resolves"
+            else
+              echo "  ❌ DANGLING"; exit 1
+            fi
+          elif [ -d drivers/kernelsu ]; then
+            echo "  ✅ drivers/kernelsu is a directory"
+          else
+            echo "  ❌ missing after setup.sh"; exit 1
+          fi
+
+          KSU_TAG=$(git -C KernelSU describe --tags --abbrev=0 2>/dev/null || echo unknown)
+          KSU_SHA=$(git -C KernelSU rev-parse --short HEAD 2>/dev/null || echo unknown)
+          KSU_DATE=$(git -C KernelSU log -1 --format=%ci 2>/dev/null || echo unknown)
+          echo ""
+          echo "  ReSukiSU tag  : ${KSU_TAG}"
+          echo "  ReSukiSU sha  : ${KSU_SHA}"
+          echo "  ReSukiSU date : ${KSU_DATE}"
+          echo "  Super-Builders: $(git -C sb-src log -1 --format=%ci)"
+          echo ""
+          echo "  (These two dates should be CLOSE. A large gap is the"
+          echo "   cause of hook-name and dispatcher mismatches.)"
+
+          echo "KSU_TAG=${KSU_TAG}" >> $GITHUB_ENV
+          echo "KSU_SHA=${KSU_SHA}" >> $GITHUB_ENV
+          echo "BUILDSUFFIX=resukisu-${KSU_TAG}-manual-hook" >> $GITHUB_ENV
+
+      - name: Neutralise yucca gate
+        run: |
+          echo "=================================================="
+          echo "  YUCCA GATE REMOVAL"
+          echo "=================================================="
+          if [ ! -f drivers/misc/early_assert.c ]; then
+            echo "  early_assert.c not present — nothing to do."
+            exit 0
+          fi
+
+          echo "--- Makefile / Kconfig references ---"
+          grep -n 'early_assert' drivers/misc/Makefile 2>/dev/null | sed 's/^/    /' || true
+
+          if grep -q 'early_assert' drivers/misc/Makefile 2>/dev/null; then
+            sed -i '/early_assert/d' drivers/misc/Makefile
+            echo "  ✅ removed early_assert from drivers/misc/Makefile"
+          else
+            echo "  ⚠️  no Makefile reference found"
+          fi
+
+          rm -f drivers/misc/early_assert.c
+          echo "  ✅ removed drivers/misc/early_assert.c"
+
+          echo ""
+          echo "--- other yucca_gate_token.h consumers ---"
+          grep -rln 'yucca_gate_token' drivers/ init/ kernel/ security/ fs/ 2>/dev/null \
+            | sed 's/^/    /' || echo "    (none)"
+
+      # ══════════════════════════════════════════════════════════
+      #  Apply 50_ -> 51_ -> 60_, then natively port 70_ hunk 2
+      # ══════════════════════════════════════════════════════════
+      - name: Apply patch stack
+        run: |
+          mkdir -p /tmp/fuzzlogs
+          : > /tmp/fuzz_summary
+          ROOT="$(pwd)"
+          SB_ABS="${ROOT}/${SB_DIR}"
+
+          # ── SAFE COUNTER ─────────────────────────────────────
+          # Never use $(grep -c ... || echo 0). grep -c PRINTS "0"
+          # and EXITS 1 on no-match, so the || appends a second
+          # zero -> "0\n0" -> arithmetic syntax error.
+          count_matches() {
+            local pat="$1" file="$2" n
+            n="$(grep -c -- "$pat" "$file" 2>/dev/null)" || n=0
+            n="$(printf '%s' "$n" | head -1 | tr -cd '0-9')"
+            [ -n "$n" ] || n=0
+            printf '%s' "$n"
+          }
+
+          apply_and_measure() {
+            local LABEL="$1" PF="$2" WD="${3:-$ROOT}"
+            local LOG="/tmp/fuzzlogs/${LABEL}.log"
+
+            echo ""
+            echo "──────────────────────────────────────────────"
+            echo "  APPLYING: ${LABEL}"
+            echo "──────────────────────────────────────────────"
+
+            if [ ! -f "$PF" ]; then
+              echo "  ⚠️  patch file not found"
+              echo "${LABEL}:X:missing" >> /tmp/fuzz_summary
+              return 1
+            fi
+
+            touch /tmp/ts_${LABEL}
+            local RC=0
+
+            pushd "$WD" >/dev/null
+            if patch -p1 --batch --forward --dry-run < "$PF" >/dev/null 2>&1; then
+              echo "  clean dry-run; applying"
+              patch -p1 --batch --forward < "$PF" 2>&1 | tee "$LOG"
+              RC=${PIPESTATUS[0]}
+            else
+              echo "  needs fuzz; applying with --fuzz=3"
+              patch -p1 --batch --forward --fuzz=3 < "$PF" 2>&1 | tee "$LOG"
+              RC=${PIPESTATUS[0]}
+            fi
+            popd >/dev/null
+
+            # GNU patch exits 0 when it SKIPS a file. Treat as failure.
+            if grep -qE "hunks? ignored|Skipping patch|can't find file to patch|No file to patch" "$LOG" 2>/dev/null; then
+              echo "  ❌ PATCH SKIPPED — nothing applied:"
+              grep -E "hunks? ignored|Skipping patch|can't find file to patch|No file to patch" "$LOG" | sed 's/^/    /'
+              echo "${LABEL}:X:skipped" >> /tmp/fuzz_summary
+              return 1
+            fi
+
+            if [ "$RC" -ne 0 ]; then
+              echo "  ❌ FAILED (exit ${RC})"
+              echo "${LABEL}:X:failed" >> /tmp/fuzz_summary
+              return 1
+            fi
+
+            local REJ
+            REJ="$(find "$WD" -name '*.rej' -newer /tmp/ts_${LABEL} 2>/dev/null || true)"
+            if [ -n "$REJ" ]; then
+              echo "  ❌ REJECTS:"
+              echo "$REJ" | while read -r r; do
+                [ -n "$r" ] || continue
+                echo "--- $r ---"; head -40 "$r"
+              done
+              echo "${LABEL}:X:rejects" >> /tmp/fuzz_summary
+              return 1
+            fi
+
+            local MAXF=0 lvl
+            for lvl in 1 2 3; do
+              if grep -q "with fuzz ${lvl}" "$LOG" 2>/dev/null; then MAXF=$lvl; fi
+            done
+            if [ "$MAXF" -eq 0 ]; then
+              echo "  ✅ applied, fuzz 0"
+              echo "${LABEL}:0:clean" >> /tmp/fuzz_summary
+            else
+              echo "  ⚠️  applied with MAX FUZZ = ${MAXF}"
+              grep -n "with fuzz" "$LOG" | sed 's/^/    /' || true
+              echo "${LABEL}:${MAXF}:fuzzed" >> /tmp/fuzz_summary
+            fi
+            return 0
+          }
+
+          # ── 50_ ──
+          apply_and_measure "50_susfs" \
+            "${SB_ABS}/50_add_susfs_in_gki-${{ env.ANDROID_VER }}.patch" "$ROOT" || exit 1
+
+          # ── 51_ ──
+          if [ "${{ inputs.apply_51 }}" = "true" ]; then
+            P51="$(find "$SB_ABS" -maxdepth 1 -name '51_*.patch' | head -1 || true)"
+            if [ -n "$P51" ]; then
+              apply_and_measure "51_enhanced" "$P51" "$ROOT" || exit 1
+            fi
+          fi
+
+          # ── 60_ ──
+          if [ "${{ inputs.apply_60 }}" = "true" ]; then
+            if apply_and_measure "60_zeromount" \
+                 "${SB_ABS}/60_zeromount-${{ env.ANDROID_VER }}.patch" "$ROOT"; then
+              echo "ZEROMOUNT_OK=1" >> $GITHUB_ENV
+            else
+              echo "::warning::ZeroMount not applied"
+            fi
+          fi
+
+          # ══════════════════════════════════════════════════════
+          #  NATIVE 70_ PORT (hunk 2 only, switch-case form)
+          #  Skips cleanly if this ReSukiSU predates the feature.
+          # ══════════════════════════════════════════════════════
+          if [ "${{ inputs.apply_70 }}" = "true" ]; then
+            echo ""
+            echo "──────────────────────────────────────────────"
+            echo "  NATIVE PORT: 70_ksu_safety (hunk 2)"
+            echo "──────────────────────────────────────────────"
+
+            DISPATCH="${ROOT}/KernelSU/kernel/supercall/dispatch.c"
+            PORT_OK=1
+
+            if [ ! -f "$DISPATCH" ]; then
+              echo "  dispatch.c not at expected path; searching..."
+              DISPATCH="$(grep -rl 'CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY' \
+                            "${ROOT}/KernelSU/kernel/" 2>/dev/null \
+                          | grep '\.c$' | head -1 || true)"
+              if [ -z "$DISPATCH" ]; then
+                echo "  ⚠️  dispatcher not found (older ReSukiSU?) — skipping"
+                echo "70_native:X:no-dispatcher" >> /tmp/fuzz_summary
+                PORT_OK=0
+              else
+                echo "  ✅ relocated: $DISPATCH"
+              fi
+            else
+              echo "  ✅ dispatcher: kernel/supercall/dispatch.c"
+            fi
+
+            if [ "$PORT_OK" = "1" ]; then
+              if grep -q 'define CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT' \
+                   "${ROOT}/include/linux/susfs_def.h" 2>/dev/null; then
+                echo "  ✅ CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT defined"
+              else
+                echo "  ⚠️  command constant missing — skipping"
+                echo "70_native:X:cmd-undefined" >> /tmp/fuzz_summary
+                PORT_OK=0
+              fi
+            fi
+
+            if [ "$PORT_OK" = "1" ]; then
+              if grep -rq 'susfs_add_sus_kstat_redirect' \
+                   "${ROOT}/include/linux/susfs.h" "${ROOT}/fs/susfs.c" 2>/dev/null; then
+                echo "  ✅ susfs_add_sus_kstat_redirect() present"
+              else
+                echo "  ⚠️  implementation missing — skipping"
+                echo "70_native:X:impl-missing" >> /tmp/fuzz_summary
+                PORT_OK=0
+              fi
+            fi
+
+            if [ "$PORT_OK" = "1" ]; then
+              if grep -rq 'KSU_SUSFS_SUS_KSTAT_REDIRECT' \
+                   "${ROOT}/fs/Kconfig" "${ROOT}/drivers/kernelsu/Kconfig" 2>/dev/null; then
+                echo "  ✅ CONFIG_KSU_SUSFS_SUS_KSTAT_REDIRECT declared"
+              else
+                echo "  ⚠️  Kconfig symbol absent — case will be compiled out (inert)"
+              fi
+            fi
+
+            if [ "$PORT_OK" = "1" ]; then
+              if grep -q 'CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT' "$DISPATCH" 2>/dev/null; then
+                echo "  ℹ️  already handled — nothing to do"
+                echo "70_native:0:already-present" >> /tmp/fuzz_summary
+                echo "KSU_SAFETY_OK=1" >> $GITHUB_ENV
+                PORT_OK=0
+              fi
+            fi
+
+            if [ "$PORT_OK" = "1" ]; then
+              ANCHOR_N="$(count_matches '^#endif //#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT$' "$DISPATCH")"
+              echo "  anchor occurrences: ${ANCHOR_N}"
+              if [ "$ANCHOR_N" != "1" ]; then
+                echo "  ⚠️  expected exactly 1 anchor — skipping"
+                echo "70_native:X:bad-anchor" >> /tmp/fuzz_summary
+                PORT_OK=0
+              fi
+            fi
+
+            if [ "$PORT_OK" = "1" ]; then
+              echo ""
+              echo "  --- BEFORE ---"
+              grep -n -B6 '^#endif //#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT$' "$DISPATCH" | sed 's/^/    /'
+
+              cp "$DISPATCH" /tmp/dispatch.c.bak
+
+              awk '
+                /^#endif \/\/#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT$/ && !inserted {
+                    print "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT_REDIRECT"
+                    print "    case CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT: {"
+                    print "        susfs_add_sus_kstat_redirect(arg);"
+                    print "        return 0;"
+                    print "    }"
+                    print "#endif"
+                    inserted = 1
+                }
+                { print }
+              ' /tmp/dispatch.c.bak > "$DISPATCH"
+
+              echo ""
+              echo "  --- AFTER ---"
+              grep -n -B10 -A2 '^#endif //#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT$' "$DISPATCH" | sed 's/^/    /'
+
+              echo ""
+              echo "  --- VERIFICATION ---"
+              VOK=1
+
+              N="$(count_matches 'CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT' "$DISPATCH")"
+              if [ "$N" = "1" ]; then
+                echo "    ✅ case inserted exactly once"
+              else
+                echo "    ❌ inserted ${N}x (expected 1)"; VOK=0
+              fi
+
+              OB="$(count_matches '{' /tmp/dispatch.c.bak)"
+              CB="$(count_matches '}' /tmp/dispatch.c.bak)"
+              OA="$(count_matches '{' "$DISPATCH")"
+              CA="$(count_matches '}' "$DISPATCH")"
+              echo "    braces: before ${OB}/${CB}  after ${OA}/${CA}"
+              if [ "$(( OA - OB ))" = "1" ] && [ "$(( CA - CB ))" = "1" ]; then
+                echo "    ✅ brace delta balanced (+1/+1)"
+              else
+                echo "    ❌ brace delta unbalanced"; VOK=0
+              fi
+
+              LB="$(wc -l < /tmp/dispatch.c.bak)"
+              LA="$(wc -l < "$DISPATCH")"
+              echo "    lines: ${LB} -> ${LA} (+$(( LA - LB )))"
+              if [ "$(( LA - LB ))" != "6" ]; then
+                echo "    ❌ expected +6 lines"; VOK=0
+              fi
+
+              if [ "$VOK" = "1" ]; then
+                echo ""
+                echo "  ✅ NATIVE PORT SUCCESSFUL"
+                echo "70_native:0:ported" >> /tmp/fuzz_summary
+                echo "KSU_SAFETY_OK=1" >> $GITHUB_ENV
+              else
+                echo ""
+                echo "  ❌ verification failed — REVERTING"
+                cp /tmp/dispatch.c.bak "$DISPATCH"
+                echo "70_native:X:verify-failed" >> /tmp/fuzz_summary
+                echo "::warning::70_ native port reverted; build continues without it"
+              fi
+            fi
+
+            echo ""
+            echo "  NOTE: hunk 1 (KSU_TP_HOOK guard) intentionally skipped."
+            echo "        Only relevant when CONFIG_KSU_SUSFS is DISABLED."
+          fi
+
+          # ── SUSFS Kconfig injection (only if 50_ did not provide it) ──
+          KCFG="drivers/kernelsu/Kconfig"
+          if [ -f "$KCFG" ] && ! grep -q 'KSU_SUSFS' "$KCFG"; then
+            printf '\nconfig KSU_SUSFS\n\tbool "Enable SUSFS for KernelSU"\n\tdepends on KSU\n\tdefault y\n' >> "$KCFG"
+            OPTS=$(grep -hroE 'CONFIG_KSU_SUSFS_[A-Z_]+' \
+              include/linux/susfs.h fs/susfs.c 2>/dev/null \
+              | sort -u | sed 's/CONFIG_KSU_SUSFS_//')
+            for o in $OPTS; do
+              D=$(echo "$o" | tr '_' ' ' | tr '[:upper:]' '[:lower:]')
+              printf '\nconfig KSU_SUSFS_%s\n\tbool "Enable %s"\n\tdepends on KSU_SUSFS\n\tdefault y\n' "$o" "$D" >> "$KCFG"
+            done
+            echo "==> Injected SUSFS Kconfig"
+          else
+            echo "==> SUSFS Kconfig already present."
+          fi
+
+          # ── Source verification ──
+          echo ""
+          echo "==> Source verification:"
+          [ -f fs/susfs.c ] && echo "  ✅ fs/susfs.c" || echo "  ❌ fs/susfs.c"
+          [ -f include/linux/susfs.h ] && echo "  ✅ include/linux/susfs.h" || echo "  ❌ include/linux/susfs.h"
+          [ -f fs/zeromount.c ] && echo "  ✅ fs/zeromount.c" || echo "  ⚠️  fs/zeromount.c"
+          [ -f include/linux/zeromount.h ] && echo "  ✅ include/linux/zeromount.h" || echo "  ⚠️  include/linux/zeromount.h"
+          grep -q 'zeromount' fs/Makefile 2>/dev/null && echo "  ✅ fs/Makefile entry" || echo "  ⚠️  fs/Makefile entry"
+          grep -rq 'ZEROMOUNT' fs/Kconfig 2>/dev/null && echo "  ✅ fs/Kconfig entry" || echo "  ⚠️  fs/Kconfig entry"
+
+          rm -rf sb-src
+
+      # ══════════════════════════════════════════════════════════
+      #  HOOK AUDIT — surface ALL inline_hook_check.mk mismatches
+      #  at once, instead of one per 6-minute build.
+      # ══════════════════════════════════════════════════════════
+      - name: Hook compatibility audit
+        if: always()
+        run: |
+          echo "=================================================="
+          echo "  HOOK AUDIT vs ReSukiSU inline_hook_check.mk"
+          echo "=================================================="
+          echo ""
+          echo "  ReSukiSU REJECTS these (old pre-static_key names):"
+          BAD=0
+          check_bad() {
+            local sym="$1" f="$2"
+            if [ -f "$f" ] && grep -q -- "$sym" "$f" 2>/dev/null; then
+              printf "    ❌ %-22s in %s\n" "$sym" "$f"
+              BAD=1
+            else
+              printf "    ✅ %-22s absent from %s\n" "$sym" "$f"
+            fi
+          }
+          check_bad ksu_vfs_read_hook   fs/read_write.c
+          check_bad ksu_input_hook      drivers/input/input.c
+          check_bad ksu_execveat_hook   fs/exec.c
+          check_bad ksu_init_rc_hook    fs/read_write.c
+          check_bad ksu_init_rc_hook    fs/stat.c
+
+          echo ""
+          echo "  ReSukiSU REQUIRES these (modern names):"
+          MISS=0
+          check_req() {
+            local sym="$1" f="$2"
+            if [ -f "$f" ] && grep -q -- "$sym" "$f" 2>/dev/null; then
+              printf "    ✅ %-32s in %s\n" "$sym" "$f"
+            else
+              printf "    ❌ %-32s MISSING from %s\n" "$sym" "$f"
+              MISS=1
+            fi
+          }
+          check_req ksu_handle_setresuid          kernel/sys.c
+          check_req ksu_handle_execveat           fs/exec.c
+          check_req ksu_handle_faccessat          fs/open.c
+          check_req ksu_handle_sys_read           fs/read_write.c
+          check_req ksu_handle_stat               fs/stat.c
+          check_req ksu_handle_sys_reboot         kernel/reboot.c
+          check_req ksu_handle_input_handle_event drivers/input/input.c
+
+          echo ""
+          if [ "$BAD" = "1" ] || [ "$MISS" = "1" ]; then
+            echo "  ⚠️  MISMATCH — this ReSukiSU and these SUSFS patches"
+            echo "      are from different eras. The compile WILL stop at"
+            echo "      inline_hook_check.mk. Try a resukisu_ref closer to"
+            echo "      the Super-Builders commit date."
+          else
+            echo "  ✅ Hook names consistent — inline_hook_check should pass."
+          fi
+          echo "=================================================="
+
+      - name: Patch report
+        if: always()
+        run: |
+          echo "=================================================="
+          echo "  EXP6 PATCH REPORT"
+          echo "=================================================="
+          echo ""
+          printf "  %-20s %-8s %s\n" "PATCH" "MAXFUZZ" "RESULT"
+          printf "  %-20s %-8s %s\n" "--------------------" "--------" "----------"
+
+          WORST=0
+          FAILED=0
+          if [ -s /tmp/fuzz_summary ]; then
+            while IFS=: read -r label fuzz result; do
+              [ -n "$label" ] || continue
+              case "$result" in
+                clean|ported|already-present) ICON="✅" ;;
+                fuzzed)                       ICON="⚠️ " ;;
+                *)                            ICON="❌"; FAILED=1 ;;
+              esac
+              printf "  %-20s %-8s %s %s\n" "$label" "$fuzz" "$ICON" "$result"
+              case "$fuzz" in
+                [0-3]) if [ "$fuzz" -gt "$WORST" ]; then WORST=$fuzz; fi ;;
+                *)     FAILED=1 ;;
+              esac
+            done < /tmp/fuzz_summary
+          else
+            echo "  (nothing recorded)"
+            FAILED=1
+          fi
+
+          echo ""
+          echo "  WORST FUZZ: ${WORST}"
+          echo "  ReSukiSU  : ${KSU_TAG:-n/a} @ ${KSU_SHA:-n/a}"
+          echo ""
+          echo "  EXP5 baseline (ksu=main):"
+          echo "    50_susfs 3 | 51_enhanced 0 | 60_zeromount 2 | 70_native 0"
+          echo "=================================================="
+
+          {
+            echo "## EXP6 — ksu=\`${{ inputs.resukisu_ref }}\`"
+            echo ""
+            echo "**Kernel:** \`${{ inputs.kernel_repo }}\`  "
+            echo "**ReSukiSU:** \`${KSU_TAG:-n/a}\` @ \`${KSU_SHA:-n/a}\`  "
+            echo "**Worst fuzz:** \`${WORST}\`"
+            echo ""
+            echo "| Patch | Max fuzz | Result |"
+            echo "|---|---|---|"
+            if [ -s /tmp/fuzz_summary ]; then
+              while IFS=: read -r l f r; do
+                [ -n "$l" ] || continue
+                echo "| \`$l\` | $f | $r |"
+              done < /tmp/fuzz_summary
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "WORST_FUZZ=${WORST}" >> $GITHUB_ENV
+
+          MAXF="${{ inputs.max_fuzz }}"
+          if [ "$MAXF" != "99" ] && [ "$WORST" -gt "$MAXF" ]; then
+            echo "::error::Worst fuzz ${WORST} exceeds max_fuzz ${MAXF}"
+            exit 1
+          fi
+          # 70_native skipping is tolerated (older KSU may lack the feature)
+          if [ "$FAILED" -eq 1 ]; then
+            if grep -qE '^(50_susfs|51_enhanced):X:' /tmp/fuzz_summary 2>/dev/null; then
+              echo "::error::A core patch (50_/51_) failed"
+              exit 1
+            fi
+            echo "::warning::Optional component skipped; continuing"
+          fi
+          echo "==> Patch gate passed."
+
+      - name: Stop after patching
+        if: inputs.patch_only
+        run: |
+          echo "patch_only=true — stopping before compile."
+          echo "Worst fuzz: ${WORST_FUZZ}"
+          echo "ReSukiSU  : ${KSU_TAG} @ ${KSU_SHA}"
+          echo ""
+          echo "Review the HOOK AUDIT above before compiling."
+          echo "Re-run with patch_only=false once hooks are consistent."
+
+      # ══════════════════════════════════════════════════════════
+      #  Build
+      # ══════════════════════════════════════════════════════════
+      - name: Restore Clang
+        if: ${{ !inputs.patch_only }}
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: clang-toolchain
+          key: clang-aosp-${{ env.CLANG_VERSION }}
+
+      - name: Download Clang (cache miss)
+        if: ${{ !inputs.patch_only && steps.cache-clang.outputs.cache-hit != 'true' }}
+        run: |
+          curl -sSfL --retry 3 --connect-timeout 30 -o clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/mirror-goog-main-llvm-toolchain-source/clang-${{ env.CLANG_VERSION }}.tar.gz" \
+            || { echo "ERROR: clang download failed"; exit 1; }
+          mkdir -p clang-toolchain
+          tar -xf clang.tar.gz -C clang-toolchain
+          rm -f clang.tar.gz
+
+      - name: Set up swap (24 GB)
+        if: ${{ !inputs.patch_only }}
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 24
+
+      - name: Generate defconfig
+        if: ${{ !inputs.patch_only }}
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
+          make -j$(nproc --all) O=out ARCH=arm64 \
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 gki_defconfig
+
+      - name: Enable configs
+        if: ${{ !inputs.patch_only }}
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
+          ./scripts/config --file out/.config -e CONFIG_KSU
+
+          KCFG="drivers/kernelsu/Kconfig"
+          if [ -f "$KCFG" ]; then
+            grep -oE '^config KSU_SUSFS[A-Z_]*' "$KCFG" | while read -r l; do
+              ./scripts/config --file out/.config -e "CONFIG_${l#config }"
+            done
+          fi
+          ./scripts/config --file out/.config -e CONFIG_KSU_MANUAL_HOOK || true
+
+          if [ "${ZEROMOUNT_OK:-0}" = "1" ]; then
+            ./scripts/config --file out/.config -e CONFIG_ZEROMOUNT
+          fi
+          if [ "${KSU_SAFETY_OK:-0}" = "1" ]; then
+            ./scripts/config --file out/.config -e CONFIG_KSU_SUSFS_SUS_KSTAT_REDIRECT || true
+          fi
+
+          ./scripts/config --file out/.config -d LTO_NONE       || true
+          ./scripts/config --file out/.config -e LTO_CLANG      || true
+          ./scripts/config --file out/.config -e LTO_CLANG_THIN || true
+          ./scripts/config --file out/.config -d LTO_CLANG_FULL || true
+          ./scripts/config --file out/.config -e CFI_CLANG      || true
+
+          make -j$(nproc --all) O=out ARCH=arm64 \
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 olddefconfig
+
+      - name: Verify config
+        if: ${{ !inputs.patch_only }}
+        run: |
+          C=out/.config
+          F=0
+          grep -q 'CONFIG_KSU=y' "$C" && echo "  ✅ CONFIG_KSU=y" || { echo "  ❌ CONFIG_KSU"; F=1; }
+          grep -q 'CONFIG_KSU_SUSFS=y' "$C" && echo "  ✅ CONFIG_KSU_SUSFS=y" || { echo "  ❌ CONFIG_KSU_SUSFS"; F=1; }
+          echo "  --- SUSFS sub-options ---"
+          grep -E '^CONFIG_KSU_SUSFS_[A-Z_]+=y' "$C" | sed 's/^/  ✅ /' || echo "  ⚠️  none"
+          if [ "${ZEROMOUNT_OK:-0}" = "1" ]; then
+            grep -q 'CONFIG_ZEROMOUNT=y' "$C" && echo "  ✅ CONFIG_ZEROMOUNT=y" || echo "  ⚠️  ZEROMOUNT not set"
+          fi
+          grep -q 'CONFIG_LTO_CLANG_THIN=y' "$C" && echo "  ✅ ThinLTO" || echo "  ⚠️  not ThinLTO"
+          grep -q 'CONFIG_CFI_CLANG=y' "$C" && echo "  ✅ CFI_CLANG=y" || echo "  ⚠️  CFI off"
+          [ "$F" -eq 1 ] && { echo "::error::critical config missing"; exit 1; } || true
+
+      - name: Verify no yucca gate
+        if: ${{ !inputs.patch_only }}
+        run: |
+          if [ -f .yucca_token ]; then
+            echo "::error::.yucca_token generated"; exit 1
+          fi
+          echo "  ✅ no .yucca_token"
+
+      - name: Build kernel
+        if: ${{ !inputs.patch_only }}
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
+          make -j$(nproc --all) O=out ARCH=arm64 \
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1
+
+      - name: Verify objects
+        if: ${{ !inputs.patch_only }}
+        run: |
+          F=0
+          find out/ -name 'susfs.o' | grep -q . && echo "  ✅ susfs.o" || { echo "  ❌ susfs.o"; F=1; }
+          if [ "${ZEROMOUNT_OK:-0}" = "1" ]; then
+            find out/ -name 'zeromount.o' | grep -q . \
+              && echo "  ✅ zeromount.o" || echo "  ⚠️  zeromount.o missing"
+          fi
+          if ls out/arch/arm64/boot/Image* >/dev/null 2>&1; then
+            echo "  ✅ Image present"
+            ls -la out/arch/arm64/boot/Image*
+          else
+            echo "  ❌ no Image"; F=1
+          fi
+          [ "$F" -eq 1 ] && exit 1 || echo "==> checks passed."
+
+      - name: Metadata
+        if: ${{ !inputs.patch_only }}
+        id: meta
+        run: |
+          echo "kernelversion=$(make kernelversion 2>/dev/null | awk -F. '{print $1"."$2"."$3}')" >> $GITHUB_OUTPUT
+          echo "date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+
+      - name: Package AnyKernel3
+        if: ${{ !inputs.patch_only }}
+        run: |
+          AK=".own-repo/.github/goodies/AnyKernel3.zip"
+          mkdir -p AnyKernel3
+          [ -f "$AK" ] && unzip -q "$AK" -d AnyKernel3 || true
+          cp out/arch/arm64/boot/Image* AnyKernel3/ 2>/dev/null || true
+          {
+            echo "SM8550 — EXP6"
+            echo "Kernel     : ${{ steps.meta.outputs.kernelversion }}"
+            echo "Source     : ${{ inputs.kernel_repo }}"
+            echo "ReSukiSU   : ${KSU_TAG} @ ${KSU_SHA}  (ref=${{ inputs.resukisu_ref }})"
+            echo "ZeroMount  : ${ZEROMOUNT_OK:-0}"
+            echo "70_ native : ${KSU_SAFETY_OK:-0}"
+            echo "Worst fuzz : ${WORST_FUZZ}"
+            echo ""
+            echo "EXPERIMENTAL — back up boot first:"
+            echo "  dd if=/dev/block/by-name/boot of=/sdcard/boot-backup.img"
+          } > AnyKernel3/CHANGELOG.txt
+
+      - name: Upload artifact
+        if: ${{ !inputs.patch_only }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP6-sm8550-${{ steps.meta.outputs.kernelversion }}-fuzz${{ env.WORST_FUZZ }}-${{ steps.meta.outputs.date }}
+          path: AnyKernel3
+          compression-level: 9
+          if-no-files-found: warn
+
+      - name: Discord notification
+        if: always()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then echo "no webhook"; exit 0; fi
+          if [ "${{ job.status }}" = "failure" ]; then
+            COLOR=15548997; ST="❌ EXP6 FAILED"
+          else
+            COLOR=10181046; ST="🧪 EXP6 OK"
+          fi
+          PAYLOAD=$(jq -n \
+            --arg t "🧪 [EXP6] SM8550 — version-matched ReSukiSU" \
+            --arg d "ksu_ref=${{ inputs.resukisu_ref }} patch_only=${{ inputs.patch_only }}" \
+            --arg s "$ST" \
+            --arg f "📏 Worst fuzz: ${WORST_FUZZ:-n/a}" \
+            --arg v "🔖 KSU: ${KSU_TAG:-n/a} @ ${KSU_SHA:-n/a}" \
+            --arg z "🧭 ZeroMount: ${ZEROMOUNT_OK:-0}" \
+            --arg u "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson c "$COLOR" \
+            '{"embeds":[{"title":$t,"description":$d,"color":$c,"fields":[
+              {"name":"Status","value":$s,"inline":false},
+              {"name":"Fuzz","value":$f,"inline":true},
+              {"name":"ZeroMount","value":$z,"inline":true},
+              {"name":"Version","value":$v,"inline":false},
+              {"name":"Log","value":("[View](" + $u + ")"),"inline":false}],
+              "footer":{"text":"SM8550 CI • EXP6"},
+              "timestamp":(now|strftime("%Y-%m-%dT%H:%M:%SZ"))}]}')
+          curl -sSf -H "Content-Type: application/json" -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK_URL" && echo sent || echo "notify failed"
