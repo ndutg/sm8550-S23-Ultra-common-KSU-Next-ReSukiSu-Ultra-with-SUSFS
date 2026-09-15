@@ -1,0 +1,118 @@
+name: Inspect Yucca ZeroMount method
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  inspect:
+    name: Extract Yucca ZeroMount integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout current working kernel repository
+        uses: actions/checkout@v4
+        with:
+          path: current-kernel
+          fetch-depth: 1
+
+      - name: Checkout Yucca kernel repository
+        uses: actions/checkout@v4
+        with:
+          repository: yucca-a/kernel_samsung_sm8550
+          ref: main
+          path: yucca-kernel
+          fetch-depth: 1
+
+      - name: Extract exact ZeroMount implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="${GITHUB_WORKSPACE}/zeromount-inspection"
+          mkdir -p "$OUT/yucca-scripts" "$OUT/current-context"
+
+          echo "Yucca commit: $(git -C yucca-kernel rev-parse HEAD)" | tee "$OUT/summary.txt"
+          echo "Current commit: $(git -C current-kernel rev-parse HEAD)" | tee -a "$OUT/summary.txt"
+
+          echo "" | tee -a "$OUT/summary.txt"
+          echo "Yucca files containing ZeroMount or metadata-hook logic:" | tee -a "$OUT/summary.txt"
+          MATCHES="$(grep -RIlE 'ZeroMount|zeromount|task_mmu metadata|metadata hook' \
+            yucca-kernel/scripts yucca-kernel/.github 2>/dev/null || true)"
+          printf '%s\n' "$MATCHES" | sed '/^$/d' | tee -a "$OUT/summary.txt"
+
+          if [ -z "$MATCHES" ]; then
+            echo "::error::No Yucca ZeroMount integration files were found."
+            exit 1
+          fi
+
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+            rel="${file#yucca-kernel/}"
+            dest="$OUT/yucca-scripts/$rel"
+            mkdir -p "$(dirname "$dest")"
+            cp "$file" "$dest"
+          done <<< "$MATCHES"
+
+          {
+            echo "=================================================="
+            echo "EXACT YUCCA ZEROMOUNT REFERENCES"
+            echo "=================================================="
+            grep -RInE -A80 -B30 \
+              'ZeroMount|zeromount|task_mmu metadata|metadata hook' \
+              yucca-kernel/scripts yucca-kernel/.github 2>/dev/null || true
+          } > "$OUT/yucca-zeromount-snippets.txt"
+
+          # Capture the Super-Builders paths and commits referenced by Yucca.
+          grep -RInE \
+            'Super-Builders|SUPER_BUILDERS|c2cb716|60_zeromount|65_zeromount' \
+            yucca-kernel/scripts yucca-kernel/.github 2>/dev/null \
+            > "$OUT/yucca-super-builders-references.txt" || true
+
+          # Capture current-tree source context around every location that failed
+          # in the low-fuzz dry run.
+          for file in \
+            fs/Kconfig fs/Makefile fs/proc/base.c fs/proc/task_mmu.c \
+            fs/stat.c fs/statfs.c; do
+            src="current-kernel/$file"
+            [ -f "$src" ] || continue
+            dest="$OUT/current-context/${file}.txt"
+            mkdir -p "$(dirname "$dest")"
+            {
+              echo "FILE: $file"
+              echo "LINES: $(wc -l < "$src")"
+              echo ""
+              case "$file" in
+                fs/Kconfig) sed -n '350,430p' "$src" ;;
+                fs/Makefile) sed -n '115,165p' "$src" ;;
+                fs/proc/base.c) sed -n '70,135p;1820,1930p' "$src" ;;
+                fs/proc/task_mmu.c) sed -n '1,70p;275,355p' "$src" ;;
+                fs/stat.c) sed -n '1,70p;225,340p' "$src" ;;
+                fs/statfs.c) sed -n '1,55p;130,210p' "$src" ;;
+              esac
+            } > "$dest"
+          done
+
+          # Also save the exact ZeroMount patch that the current workflow uses.
+          git clone --quiet https://github.com/Enginex0/Super-Builders.git super-builders
+          git -C super-builders checkout --quiet c2cb71614868fe742cbffee2b6f3126523432673
+          PATCH="super-builders/android13-5.15/ReSukiSU/patches/60_zeromount-android13-5.15.patch"
+          test -s "$PATCH" || { echo "::error::Expected ZeroMount patch missing"; exit 1; }
+          cp "$PATCH" "$OUT/60_zeromount-android13-5.15.patch"
+
+          echo "Inspection package created:"
+          find "$OUT" -type f -print | sort
+
+      - name: Upload inspection package
+        uses: actions/upload-artifact@v4
+        with:
+          name: yucca-zeromount-method-${{ github.run_number }}
+          path: zeromount-inspection/
+          compression-level: 9
+          if-no-files-found: error
+.github/workflows/inspect-yucca-zeromount-method.yml
