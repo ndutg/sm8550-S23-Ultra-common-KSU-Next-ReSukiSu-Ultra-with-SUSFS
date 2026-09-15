@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(pwd)"
+MODE="${1:-resukisu}"
+OUT_DIR="${ROOT}/out/${MODE}"
+IMAGE="${OUT_DIR}/arch/arm64/boot/Image"
+REPORT="${ROOT}/yucca-component-report.txt"
+AK_DIR="${ROOT}/anykernel3"
+ZIP_DIR="${ROOT}/flashable-output"
+
+log() {
+    printf '[TEST] %s\n' "$*"
+}
+
+fail() {
+    printf '::error::%s\n' "$*" >&2
+    exit 1
+}
+
+report_line() {
+    printf '%s\n' "$*" | tee -a "$REPORT"
+}
+
+git_report() {
+    local label="$1"
+    local dir="$2"
+
+    report_line ""
+    report_line "[$label]"
+
+    if [[ ! -d "$dir/.git" ]]; then
+        report_line "Path: $dir"
+        report_line "Git repository: not present"
+        return 0
+    fi
+
+    report_line "Path: $dir"
+    report_line "Remote: $(git -C "$dir" remote get-url origin 2>/dev/null || echo unknown)"
+    report_line "Branch: $(git -C "$dir" branch --show-current 2>/dev/null || true)"
+    report_line "Commit: $(git -C "$dir" rev-parse HEAD)"
+    report_line "Commit date: $(git -C "$dir" log -1 --format='%ci')"
+    report_line "Subject: $(git -C "$dir" log -1 --format='%s')"
+}
+
+rm -f "$REPORT"
+mkdir -p "$ZIP_DIR"
+
+report_line "YUCCA CURRENT INTEGRATION TEST"
+report_line "================================"
+report_line "Mode: $MODE"
+report_line "Kernel source commit: $(git rev-parse HEAD)"
+report_line "Kernel version: $(make -s kernelversion)"
+
+log "Running Yucca build in $MODE mode"
+
+set +e
+./scripts/build/build.sh "$MODE" 2>&1 | tee yucca-current-build.log
+BUILD_RC=${PIPESTATUS[0]}
+set -e
+
+# Yucca may return failure only because its internal packaging step could
+# not find anykernel3. Continue if the compiled Image really exists.
+if [[ $BUILD_RC -ne 0 ]]; then
+    if [[ -s "$IMAGE" ]]; then
+        log "Build command returned $BUILD_RC, but the kernel Image exists."
+        log "Continuing with independent validation and packaging."
+    else
+        fail "Kernel compilation failed and no Image was produced."
+    fi
+fi
+
+[[ -s "$IMAGE" ]] || fail "Compiled Image is missing: $IMAGE"
+
+git_report "Kernel source" "$ROOT"
+git_report "ReSukiSU" "$ROOT/KernelSU"
+git_report "SUSFS cache" "$ROOT/.features_cache/susfs"
+git_report "Super-Builders cache" "$ROOT/.features_cache/Super-Builders"
+
+report_line ""
+report_line "[Compiled versions]"
+
+RESUKISU_CODE="$(
+    grep -Eo 'ReSukiSU version code: [0-9]+' yucca-current-build.log |
+    tail -1 |
+    awk '{print $4}'
+)"
+
+RESUKISU_NAME="$(
+    grep -E 'ReSukiSU version name:' yucca-current-build.log |
+    tail -1 |
+    sed 's/^.*ReSukiSU version name:[[:space:]]*//'
+)"
+
+SUSFS_VERSION="$(
+    grep -E 'SUSFS_VERSION:[[:space:]]*v?[0-9]+\.[0-9]+\.[0-9]+' \
+        yucca-current-build.log |
+    tail -1 |
+    sed 's/^.*SUSFS_VERSION:[[:space:]]*//'
+)"
+
+report_line "ReSukiSU version code: ${RESUKISU_CODE:-not detected}"
+report_line "ReSukiSU version name: ${RESUKISU_NAME:-not detected}"
+report_line "SUSFS version: ${SUSFS_VERSION:-not detected}"
+report_line "Kernel Image: $IMAGE"
+report_line "Kernel Image size: $(stat -c '%s bytes' "$IMAGE")"
+report_line "Kernel release: $(cat "$OUT_DIR/include/config/kernel.release" 2>/dev/null || echo unknown)"
+
+[[ -n "${RESUKISU_CODE:-}" ]] ||
+    fail "Could not detect the compiled ReSukiSU version code."
+
+[[ -n "${SUSFS_VERSION:-}" ]] ||
+    fail "Could not detect the compiled SUSFS version."
+
+if (( RESUKISU_CODE < 35119 )); then
+    fail "Unexpected old ReSukiSU version code: $RESUKISU_CODE"
+fi
+
+case "$SUSFS_VERSION" in
+    v2.3.0|2.3.0)
+        ;;
+    *)
+        fail "Expected SUSFS v2.3.0, detected: $SUSFS_VERSION"
+        ;;
+esac
+
+log "Checking compiled feature objects"
+
+SUSFS_OBJECT="$OUT_DIR/fs/susfs.o"
+ZEROMOUNT_OBJECT="$OUT_DIR/fs/zeromount.o"
+KSU_OBJECT="$OUT_DIR/drivers/kernelsu/built-in.a"
+
+[[ -s "$SUSFS_OBJECT" ]] ||
+    fail "SUSFS object was not compiled: $SUSFS_OBJECT"
+
+[[ -s "$ZEROMOUNT_OBJECT" ]] ||
+    fail "ZeroMount object was not compiled: $ZEROMOUNT_OBJECT"
+
+[[ -s "$KSU_OBJECT" ]] ||
+    fail "ReSukiSU archive was not compiled: $KSU_OBJECT"
+
+report_line ""
+report_line "[Compiled feature objects]"
+report_line "SUSFS object: present"
+report_line "ZeroMount object: present"
+report_line "ReSukiSU archive: present"
+
+log "Checking patch rejects"
+
+REJECTS="$(
+    find "$ROOT" \
+        -path "$OUT_DIR" -prune -o \
+        -type f -name '*.rej' -print
+)"
+
+if [[ -n "$REJECTS" ]]; then
+    printf '%s\n' "$REJECTS"
+    fail "Patch reject files were found."
+fi
+
+report_line "Patch rejects: none"
+
+log "Preparing AnyKernel3"
+
+rm -rf "$AK_DIR"
+
+# Use the existing AnyKernel3 ZIP from your repository when available.
+AK_ARCHIVE=""
+
+for candidate in \
+    "$ROOT/.own-repo/.github/goodies/AnyKernel3.zip" \
+    "$ROOT/.github/goodies/AnyKernel3.zip" \
+    "$ROOT/AnyKernel3.zip"; do
+    if [[ -s "$candidate" ]]; then
+        AK_ARCHIVE="$candidate"
+        break
+    fi
+done
+
+if [[ -n "$AK_ARCHIVE" ]]; then
+    mkdir -p "$AK_DIR"
+    unzip -q "$AK_ARCHIVE" -d "$AK_DIR"
+else
+    fail "No AnyKernel3 template ZIP was found. Add it under .github/goodies/AnyKernel3.zip."
+fi
+
+# Flatten one accidental wrapper directory if necessary.
+if [[ ! -f "$AK_DIR/anykernel.sh" ]]; then
+    WRAPPER="$(
+        find "$AK_DIR" -mindepth 1 -maxdepth 1 -type d |
+        head -1
+    )"
+
+    if [[ -n "$WRAPPER" && -f "$WRAPPER/anykernel.sh" ]]; then
+        TEMP_AK="${ROOT}/.anykernel3-flat"
+        rm -rf "$TEMP_AK"
+        mkdir -p "$TEMP_AK"
+        cp -a "$WRAPPER/." "$TEMP_AK/"
+        rm -rf "$AK_DIR"
+        mv "$TEMP_AK" "$AK_DIR"
+    fi
+fi
+
+[[ -s "$AK_DIR/anykernel.sh" ]] ||
+    fail "anykernel.sh is missing from AnyKernel3."
+
+[[ -d "$AK_DIR/META-INF" ]] ||
+    fail "META-INF is missing from AnyKernel3."
+
+[[ -d "$AK_DIR/tools" ]] ||
+    fail "tools is missing from AnyKernel3."
+
+rm -rf "$AK_DIR/.git" "$AK_DIR/.github"
+
+find "$AK_DIR" -maxdepth 1 -type f \
+    \( -name 'Image' -o -name 'Image.gz' -o -name 'Image.gz-dtb' \) \
+    -delete
+
+cp "$IMAGE" "$AK_DIR/Image"
+
+SHORT_KSU="$(
+    git -C "$ROOT/KernelSU" rev-parse --short=8 HEAD 2>/dev/null ||
+    echo unknown
+)"
+
+SUSFS_LABEL="${SUSFS_VERSION#v}"
+DATE="$(date -u +%Y%m%d)"
+ZIP_NAME="SM8550-ReSukiSU-${RESUKISU_CODE}-SUSFS-${SUSFS_LABEL}-${SHORT_KSU}-${DATE}.zip"
+ZIP_PATH="${ZIP_DIR}/${ZIP_NAME}"
+
+cat > "$AK_DIR/BUILD-INFO.txt" <<EOF
+Kernel source: $(git rev-parse HEAD)
+Kernel version: $(make -s kernelversion)
+Kernel release: $(cat "$OUT_DIR/include/config/kernel.release" 2>/dev/null || echo unknown)
+ReSukiSU code: $RESUKISU_CODE
+ReSukiSU name: $RESUKISU_NAME
+ReSukiSU commit: $(git -C KernelSU rev-parse HEAD 2>/dev/null || echo unknown)
+SUSFS version: $SUSFS_VERSION
+Build mode: $MODE
+EOF
+
+log "Creating flashable ZIP"
+
+rm -f "$ZIP_PATH"
+
+(
+    cd "$AK_DIR"
+    zip -qr9 "$ZIP_PATH" . \
+        -x '.git/*' \
+           '.github/*' \
+           '*.zip'
+)
+
+[[ -s "$ZIP_PATH" ]] || fail "Flashable ZIP was not created."
+
+unzip -t "$ZIP_PATH"
+
+unzip -Z1 "$ZIP_PATH" | grep -qx 'anykernel.sh' ||
+    fail "anykernel.sh is not at the ZIP root."
+
+unzip -Z1 "$ZIP_PATH" | grep -q '^META-INF/' ||
+    fail "META-INF is not at the ZIP root."
+
+unzip -Z1 "$ZIP_PATH" | grep -q '^tools/' ||
+    fail "tools is not at the ZIP root."
+
+unzip -Z1 "$ZIP_PATH" | grep -qx 'Image' ||
+    fail "Image is not at the ZIP root."
+
+report_line ""
+report_line "[Final package]"
+report_line "ZIP: $ZIP_PATH"
+report_line "ZIP size: $(stat -c '%s bytes' "$ZIP_PATH")"
+report_line "SHA256: $(sha256sum "$ZIP_PATH" | awk '{print $1}')"
+report_line "ZIP integrity: passed"
+report_line "AnyKernel3 root structure: passed"
+
+log "Test completed successfully"
+log "Report: $REPORT"
+log "Flashable ZIP: $ZIP_PATH"
