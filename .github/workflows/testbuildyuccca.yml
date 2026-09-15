@@ -6,7 +6,7 @@ on:
       script_path:
         description: "Path to the test script in this repository"
         required: true
-        default: "script.sh"
+        default: "scripts/script.sh"
         type: string
       mode:
         description: "Build mode passed to the script"
@@ -84,13 +84,29 @@ jobs:
               exit 1
               ;;
           esac
-          test -f "$SCRIPT_PATH" || {
-            echo "::error::Script not found: $SCRIPT_PATH"
+          if [ ! -f "$SCRIPT_PATH" ]; then
+            echo "Requested script was not found: $SCRIPT_PATH"
+            echo "Searching common locations..."
+
+            for candidate in               "scripts/script.sh"               "script.sh"               "scripts/ci/script.sh"; do
+              if [ -f "$candidate" ]; then
+                SCRIPT_PATH="$candidate"
+                echo "Found script at: $SCRIPT_PATH"
+                break
+              fi
+            done
+          fi
+
+          if [ ! -f "$SCRIPT_PATH" ]; then
+            echo "::error::Script was not found. Shell scripts in this checkout are:"
+            find . -maxdepth 4 -type f -name '*.sh'               -not -path './.git/*' -print | sort
             exit 1
-          }
+          fi
+
           bash -n "$SCRIPT_PATH"
           chmod +x "$SCRIPT_PATH"
           echo "absolute_path=${GITHUB_WORKSPACE}/${SCRIPT_PATH}" >> "$GITHUB_OUTPUT"
+          echo "relative_path=${SCRIPT_PATH}" >> "$GITHUB_OUTPUT"
           echo "Script syntax is valid: $SCRIPT_PATH"
 
       - name: Run test script
