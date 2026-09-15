@@ -497,14 +497,50 @@ jobs:
           echo "kernelversion=$(make kernelversion 2>/dev/null | awk -F. '{print $1"."$2"."$3}')" >> "$GITHUB_OUTPUT"
           echo "date=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Package AnyKernel3
+      - name: Package and validate flashable AnyKernel3 ZIP
         if: ${{ !inputs.patch_only }}
+        id: package
         run: |
-          mkdir -p AnyKernel3
-          AK=".own-repo/.github/goodies/AnyKernel3.zip"
-          if [ -f "$AK" ]; then unzip -q "$AK" -d AnyKernel3; fi
-          cp out/arch/arm64/boot/Image* AnyKernel3/
-          cat > AnyKernel3/CHANGELOG.txt <<EOF
+          set -e
+
+          AK_SOURCE=".own-repo/.github/goodies/AnyKernel3.zip"
+          PACKAGE_DIR="${GITHUB_WORKSPACE}/AnyKernel3"
+          ZIP_BASENAME="EXP7.1-sm8550-${{ steps.meta.outputs.kernelversion }}-ReSukiSU-${KSU_SHA}-ZeroMount-fuzz${WORST_FUZZ}-${{ steps.meta.outputs.date }}"
+          ZIP_PATH="${GITHUB_WORKSPACE}/${ZIP_BASENAME}.zip"
+
+          echo "==> Preparing AnyKernel3 package..."
+
+          test -s "$AK_SOURCE" || {
+            echo "::error::AnyKernel3 template not found: $AK_SOURCE"
+            exit 1
+          }
+
+          rm -rf "$PACKAGE_DIR"
+          mkdir -p "$PACKAGE_DIR"
+          unzip -q "$AK_SOURCE" -d "$PACKAGE_DIR"
+
+          # Remove metadata and any kernel images inherited from the template.
+          rm -rf \
+            "$PACKAGE_DIR/.git" \
+            "$PACKAGE_DIR/.github"
+
+          find "$PACKAGE_DIR" -maxdepth 1 -type f \
+            \( -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" \) \
+            -delete
+
+          # Prefer Image.gz when generated; otherwise use raw Image.
+          if [ -s out/arch/arm64/boot/Image.gz ]; then
+            cp out/arch/arm64/boot/Image.gz "$PACKAGE_DIR/Image.gz"
+            KERNEL_ENTRY="Image.gz"
+          elif [ -s out/arch/arm64/boot/Image ]; then
+            cp out/arch/arm64/boot/Image "$PACKAGE_DIR/Image"
+            KERNEL_ENTRY="Image"
+          else
+            echo "::error::No compiled kernel image was found."
+            exit 1
+          fi
+
+          cat > "$PACKAGE_DIR/CHANGELOG.txt" <<EOF
           SM8550 EXP7.1
           Kernel: ${{ steps.meta.outputs.kernelversion }}
           Kernel source: ${KERNEL_REPO}@${KERNEL_REF}
@@ -515,13 +551,75 @@ jobs:
           Worst fuzz: ${WORST_FUZZ}
           EOF
 
-      - name: Upload artifact
+          echo "==> Validating package directory..."
+
+          test -s "$PACKAGE_DIR/anykernel.sh" || {
+            echo "::error::anykernel.sh is missing."
+            exit 1
+          }
+
+          test -d "$PACKAGE_DIR/META-INF" || {
+            echo "::error::META-INF is missing."
+            exit 1
+          }
+
+          test -d "$PACKAGE_DIR/tools" || {
+            echo "::error::AnyKernel3 tools directory is missing."
+            exit 1
+          }
+
+          test -s "$PACKAGE_DIR/$KERNEL_ENTRY" || {
+            echo "::error::Kernel entry is missing or empty."
+            exit 1
+          }
+
+          echo "==> Creating recovery-flashable ZIP..."
+
+          (
+            cd "$PACKAGE_DIR"
+            zip -r9 "$ZIP_PATH" . \
+              -x ".git/*" \
+                 ".github/*" \
+                 "*.zip"
+          )
+
+          echo "==> Testing ZIP integrity..."
+          unzip -t "$ZIP_PATH"
+
+          echo "==> Checking required ZIP entries..."
+          unzip -Z1 "$ZIP_PATH" | grep -qx "anykernel.sh" || {
+            echo "::error::anykernel.sh is not at the ZIP root."
+            exit 1
+          }
+
+          unzip -Z1 "$ZIP_PATH" | grep -q "^META-INF/" || {
+            echo "::error::META-INF is not at the ZIP root."
+            exit 1
+          }
+
+          unzip -Z1 "$ZIP_PATH" | grep -q "^tools/" || {
+            echo "::error::tools is not at the ZIP root."
+            exit 1
+          }
+
+          unzip -Z1 "$ZIP_PATH" | grep -qx "$KERNEL_ENTRY" || {
+            echo "::error::$KERNEL_ENTRY is not at the ZIP root."
+            exit 1
+          }
+
+          echo "==> Flashable ZIP created:"
+          ls -lh "$ZIP_PATH"
+
+          echo "zip_name=${ZIP_BASENAME}" >> "$GITHUB_OUTPUT"
+          echo "zip_path=${ZIP_PATH}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload flashable AnyKernel3 ZIP
         if: ${{ !inputs.patch_only }}
         uses: actions/upload-artifact@v4
         with:
-          name: EXP7.1-sm8550-${{ steps.meta.outputs.kernelversion }}-ksu${{ env.KSU_SHA }}-fuzz${{ env.WORST_FUZZ }}-${{ steps.meta.outputs.date }}
-          path: AnyKernel3
-          compression-level: 9
+          name: ${{ steps.package.outputs.zip_name }}
+          path: ${{ steps.package.outputs.zip_path }}
+          compression-level: 0
           if-no-files-found: error
 
       - name: Build summary
