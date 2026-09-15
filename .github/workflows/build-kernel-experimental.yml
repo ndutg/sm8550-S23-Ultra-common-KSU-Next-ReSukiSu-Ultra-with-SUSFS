@@ -1,4 +1,4 @@
-name: Test SM8550 ReSukiSU + Yucca-Style ZeroMount + ThinLTO
+name: Test SM8550 ReSukiSU + Yucca ZeroMount + ThinLTO v2
 
 on:
   workflow_dispatch:
@@ -740,14 +740,16 @@ jobs:
           decl = [i for i, line in enumerate(lines)
                   if 'struct filename *fname = NULL;' in line]
           hook = [i for i, line in enumerate(lines)
-                  if 'zeromount_getname_hook' in line]
+                  if 'Try ZeroMount hook for relative paths' in line]
 
           if len(decl) != 1:
               raise SystemExit(
                   f'Expected one fname declaration in fs/stat.c, found {len(decl)}'
               )
-          if not hook:
-              raise SystemExit('ZeroMount getname hook missing from fs/stat.c')
+          if len(hook) != 1:
+              raise SystemExit(
+                  f'Expected one relative-path ZeroMount block in fs/stat.c, found {len(hook)}'
+              )
           if decl[0] > hook[0]:
               raise SystemExit(
                   'fname declaration remains after ZeroMount executable code'
@@ -1084,13 +1086,13 @@ jobs:
           echo "========================================================"
           echo "  VERDICT: ${FLASH_PRIORITY}"
           echo ""
-          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-yucca-zeromount-thinlto-test-${{ steps.meta.outputs.date }}"
+          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-yucca-zeromount-thinlto-test-v2-${{ steps.meta.outputs.date }}"
           echo "========================================================"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-yucca-zeromount-thinlto-test-${{ steps.meta.outputs.date }}
+          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-yucca-zeromount-thinlto-test-v2-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
           if-no-files-found: warn
@@ -1132,7 +1134,7 @@ jobs:
           fi
 
           VARIANT="${{ matrix.display_name }}"
-          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-yucca-zeromount-thinlto-test-${{ steps.meta.outputs.date }}"
+          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-yucca-zeromount-thinlto-test-v2-${{ steps.meta.outputs.date }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Build the JSON payload
