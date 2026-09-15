@@ -1,4 +1,4 @@
-name: Test SM8550 ReSukiSU + ZeroMount + ThinLTO
+name: Test SM8550 ReSukiSU + Low-Fuzz ZeroMount + ThinLTO
 
 on:
   workflow_dispatch:
@@ -562,37 +562,138 @@ jobs:
 
           rm -rf susfs4ksu
 
-      - name: Apply Super-Builders ZeroMount only
+      - name: Apply ZeroMount with strict low-fuzz validation
         run: |
           set -euo pipefail
-          echo "==> Importing only the pinned Super-Builders ZeroMount patch..."
+
+          echo "=================================================="
+          echo "  ZEROMOUNT LOW-FUZZ TEST"
+          echo "=================================================="
+          echo "Keeping the existing ReSukiSU, SUSFS, and AK3 pipeline."
+          echo "Testing only the pinned Super-Builders ZeroMount patch."
+
           git clone --quiet "${SUPER_BUILDERS_REPO}" super-builders
           git -C super-builders checkout --quiet "${SUPER_BUILDERS_COMMIT}"
+
           PATCH_FILE="super-builders/${ZERO_MOUNT_PATCH}"
-          test -s "$PATCH_FILE" || { echo "::error::Missing $PATCH_FILE"; exit 1; }
+          PATCH_LOG="/tmp/zeromount.patch.log"
+          DRY_LOG="/tmp/zeromount.dry-run.log"
+
+          test -s "$PATCH_FILE" || {
+            echo "::error::ZeroMount patch not found: $PATCH_FILE"
+            find super-builders/android13-5.15 -maxdepth 5 \
+              -type f -name '*zeromount*.patch' -print || true
+            exit 1
+          }
+
+          echo "Super-Builders SHA: $(git -C super-builders rev-parse HEAD)"
+          echo "Patch: $PATCH_FILE"
+
           find . -type f -name '*.rej' -delete
+          rm -f "$PATCH_LOG" "$DRY_LOG"
+
+          echo "==> Testing ZeroMount at fuzz 0..."
+          if patch -p1 --batch --forward --fuzz=0 --dry-run \
+               < "$PATCH_FILE" > "$DRY_LOG" 2>&1; then
+            APPLY_FUZZ=0
+          else
+            echo "==> Fuzz 0 did not apply cleanly. Testing fuzz 1..."
+            if patch -p1 --batch --forward --fuzz=1 --dry-run \
+                 < "$PATCH_FILE" > "$DRY_LOG" 2>&1; then
+              APPLY_FUZZ=1
+            else
+              echo ""
+              echo "::error::ZeroMount cannot be applied safely at fuzz 0 or 1."
+              echo "::error::This test intentionally refuses fuzz 2 or 3."
+              echo "--- dry-run output ---"
+              cat "$DRY_LOG"
+              echo "--- end dry-run output ---"
+              exit 1
+            fi
+          fi
+
+          echo "==> Applying ZeroMount at fuzz ${APPLY_FUZZ}..."
           set +e
-          patch -p1 --batch --forward --fuzz=3 --no-backup-if-mismatch < "$PATCH_FILE" 2>&1 | tee /tmp/zeromount.patch.log
+          patch -p1 --batch --forward --fuzz="${APPLY_FUZZ}" \
+            --no-backup-if-mismatch < "$PATCH_FILE" 2>&1 | tee "$PATCH_LOG"
           PATCH_RC=${PIPESTATUS[0]}
           set -e
-          [ "$PATCH_RC" -eq 0 ] || { echo "::error::ZeroMount patch failed"; exit 1; }
-          if grep -qE "hunks? ignored|Skipping patch|can't find file to patch|No file to patch|FAILED" /tmp/zeromount.patch.log; then
-            echo "::error::ZeroMount patch skipped or failed a hunk"
+
+          if [ "$PATCH_RC" -ne 0 ]; then
+            echo "::error::ZeroMount patch returned exit code ${PATCH_RC}."
             exit 1
           fi
+
+          if grep -qE \
+               "with fuzz [2-9]|hunks? ignored|Skipping patch|can't find file to patch|No file to patch|FAILED" \
+               "$PATCH_LOG"; then
+            echo "::error::ZeroMount produced a skipped, failed, or excessive-fuzz hunk."
+            grep -nE \
+              "with fuzz [2-9]|hunks? ignored|Skipping patch|can't find file to patch|No file to patch|FAILED" \
+              "$PATCH_LOG" || true
+            exit 1
+          fi
+
           REJECTS="$(find . -type f -name '*.rej' -print)"
-          [ -z "$REJECTS" ] || { echo "$REJECTS"; echo "::error::ZeroMount rejects found"; exit 1; }
-          test -s fs/zeromount.c || { echo "::error::fs/zeromount.c missing"; exit 1; }
-          test -s include/linux/zeromount.h || { echo "::error::include/linux/zeromount.h missing"; exit 1; }
-          grep -q 'zeromount' fs/Makefile || { echo "::error::fs/Makefile entry missing"; exit 1; }
-          grep -q 'ZEROMOUNT' fs/Kconfig || { echo "::error::fs/Kconfig entry missing"; exit 1; }
-          MAX_FUZZ=0
-          for level in 1 2 3; do
-            grep -q "with fuzz ${level}" /tmp/zeromount.patch.log && MAX_FUZZ=$level || true
-          done
+          if [ -n "$REJECTS" ]; then
+            echo "::error::ZeroMount reject files were created:"
+            printf '%s\n' "$REJECTS"
+            exit 1
+          fi
+
+          test -s fs/zeromount.c || {
+            echo "::error::fs/zeromount.c is missing."
+            exit 1
+          }
+          test -s include/linux/zeromount.h || {
+            echo "::error::include/linux/zeromount.h is missing."
+            exit 1
+          }
+          grep -q 'zeromount' fs/Makefile || {
+            echo "::error::fs/Makefile has no ZeroMount entry."
+            exit 1
+          }
+          grep -q 'ZEROMOUNT' fs/Kconfig || {
+            echo "::error::fs/Kconfig has no CONFIG_ZEROMOUNT entry."
+            exit 1
+          }
+
+          # The previous fuzz-3 build placed a declaration after executable
+          # code in fs/stat.c. Reject that exact malformed result before compile.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('fs/stat.c')
+          lines = path.read_text().splitlines()
+          declaration = re.compile(r'^\s*struct\s+filename\s*\*\s*fname\s*=\s*NULL\s*;')
+
+          for index, line in enumerate(lines):
+              if not declaration.search(line):
+                  continue
+              start = max(0, index - 24)
+              context = lines[start:index]
+              statement_seen = False
+              for previous in context:
+                  stripped = previous.strip()
+                  if not stripped or stripped.startswith(('#', '/*', '*', '//')):
+                      continue
+                  if stripped.endswith((';', '{')) and not re.match(
+                      r'^(struct|union|enum|const|unsigned|signed|int|long|short|bool|char|void|size_t|umode_t|uid_t|gid_t)\b',
+                      stripped,
+                  ):
+                      statement_seen = True
+              if statement_seen:
+                  print(f'Unsafe late declaration at fs/stat.c:{index + 1}: {line}')
+                  raise SystemExit(1)
+
+          print('fs/stat.c ZeroMount declaration placement check passed.')
+          PY
+
           echo "ZEROMOUNT_ENABLED=1" >> "$GITHUB_ENV"
-          echo "ZEROMOUNT_MAX_FUZZ=${MAX_FUZZ}" >> "$GITHUB_ENV"
-          echo "==> ZeroMount applied; maximum fuzz ${MAX_FUZZ}."
+          echo "ZEROMOUNT_MAX_FUZZ=${APPLY_FUZZ}" >> "$GITHUB_ENV"
+          echo "==> ZeroMount applied successfully at fuzz ${APPLY_FUZZ}."
+
           rm -rf super-builders
 
       - name: Resolve kernel version and date
@@ -906,13 +1007,13 @@ jobs:
           echo "========================================================"
           echo "  VERDICT: ${FLASH_PRIORITY}"
           echo ""
-          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-thinlto-test-${{ steps.meta.outputs.date }}"
+          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-lowfuzz-thinlto-test-${{ steps.meta.outputs.date }}"
           echo "========================================================"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-thinlto-test-${{ steps.meta.outputs.date }}
+          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-lowfuzz-thinlto-test-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
           if-no-files-found: warn
@@ -954,7 +1055,7 @@ jobs:
           fi
 
           VARIANT="${{ matrix.display_name }}"
-          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-thinlto-test-${{ steps.meta.outputs.date }}"
+          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-lowfuzz-thinlto-test-${{ steps.meta.outputs.date }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Build the JSON payload
