@@ -115,4 +115,3 @@ jobs:
           path: zeromount-inspection/
           compression-level: 9
           if-no-files-found: error
-.github/workflows/inspect-yucca-zeromount-method.yml
