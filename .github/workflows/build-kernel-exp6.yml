@@ -1,75 +1,67 @@
-name: "[EXP7.1] SM8550 - pinned ReSukiSU + Super-Builders"
+name: Build SM8550 ReSukiSU without Yucca gate
 
 on:
   workflow_dispatch:
     inputs:
-      patch_only:
-        description: "Apply and audit patches only, without compiling"
-        type: boolean
-        default: true
-      max_fuzz:
-        description: "Maximum permitted fuzz (0-3, 99 disables the gate)"
+      yucca_ref:
+        description: "Yucca kernel branch, tag, or commit"
+        required: true
+        default: "main"
         type: string
-        default: "99"
-      resukisu_pin:
-        description: "ReSukiSU commit used by Super-Builders"
-        type: string
-        default: "47167aa7"
+      mode:
+        description: "Build mode"
+        required: true
+        default: "resukisu"
+        type: choice
+        options:
+          - resukisu
+          - lkm
 
 permissions:
   contents: read
-  actions: write
 
 env:
-  KERNEL_REPO: yucca-a/kernel_samsung_sm8550
-  KERNEL_REF: main
-  OWN_REPO: ndutg/sm8550-S23-Ultra-common-KSU-Next-ReSukiSu-Ultra-with-SUSFS
-  OWN_REF: android13-5.15
-  ANDROID_VER: android13-5.15
-  CLANG_VERSION: r584948
-  SB_REPO: https://github.com/Enginex0/Super-Builders.git
-  SB_COMMIT: c2cb71614868fe742cbffee2b6f3126523432673
-  RESUKISU_SETUP: https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
-    name: "EXP7.1 ReSukiSU ${{ inputs.resukisu_pin }}"
+    name: SM8550 ${{ inputs.mode }} no-gate
     runs-on: ubuntu-24.04
-    timeout-minutes: 340
+    timeout-minutes: 360
 
     steps:
       - name: Free disk space
+        shell: bash
         run: |
+          set -euo pipefail
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
           sudo rm -rf /usr/local/share/boost /usr/local/.ghcup || true
           sudo rm -rf /usr/share/swift /usr/local/share/powershell || true
           sudo rm -rf /usr/local/share/chromium /usr/local/lib/node_modules || true
-          sudo rm -rf "${AGENT_TOOLSDIRECTORY}" || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}" || true
           sudo docker image prune --all --force || true
           sudo apt-get clean || true
           df -h /
 
-      - name: Checkout clean kernel source
+      - name: Checkout Yucca kernel source
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.KERNEL_REPO }}
-          ref: ${{ env.KERNEL_REF }}
+          repository: yucca-a/kernel_samsung_sm8550
+          ref: ${{ inputs.yucca_ref }}
           fetch-depth: 1
+          path: kernel
 
-      - name: Checkout own repo for AnyKernel3
-        if: ${{ !inputs.patch_only }}
+      - name: Checkout packaging source
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.OWN_REPO }}
-          ref: ${{ env.OWN_REF }}
+          path: packaging-source
           fetch-depth: 1
-          path: .own-repo
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ccache cpio curl dwarves flex \
@@ -77,544 +69,205 @@ jobs:
             liblz4-tool libssl-dev lz4 lzop pahole perl \
             python-is-python3 python3 rsync tar unzip zip zlib1g-dev
 
-      - name: Fetch pinned Super-Builders patch set
-        run: |
-          git clone --quiet "${SB_REPO}" sb-src
-          git -C sb-src checkout --quiet "${SB_COMMIT}"
-
-          SB_DIR="sb-src/${ANDROID_VER}/ReSukiSU/patches"
-          PIN_FILE="sb-src/${ANDROID_VER}/resukisu-pin.txt"
-
-          test -d "$SB_DIR" || { echo "ERROR: Missing $SB_DIR"; exit 1; }
-          test -f "$PIN_FILE" || { echo "ERROR: Missing $PIN_FILE"; exit 1; }
-
-          REPO_PIN="$(tr -d '[:space:]' < "$PIN_FILE")"
-          echo "Super-Builders commit : $(git -C sb-src rev-parse HEAD)"
-          echo "Super-Builders date   : $(git -C sb-src log -1 --format=%ci)"
-          echo "Repository pin        : ${REPO_PIN}"
-          echo "Requested pin         : ${{ inputs.resukisu_pin }}"
-
-          if [ "$REPO_PIN" != "${{ inputs.resukisu_pin }}" ]; then
-            echo "::warning::Input pin differs from Super-Builders resukisu-pin.txt"
-          fi
-
-          echo "SB_DIR=${SB_DIR}" >> "$GITHUB_ENV"
-          echo "REPO_PIN=${REPO_PIN}" >> "$GITHUB_ENV"
-          ls -la "$SB_DIR"
-
-      - name: Setup and pin ReSukiSU exactly like Super-Builders
-        run: |
-          # setup.sh may not expose the historical susfs-ksud branch anymore.
-          # Use main only to create the integration, then detach to the exact
-          # SHA from Super-Builders resukisu-pin.txt.
-          curl -sSfL --retry 3 --connect-timeout 20 "${RESUKISU_SETUP}" \
-            | bash -s main
-
-          test -d KernelSU/.git || { echo "ERROR: KernelSU repo was not created"; exit 1; }
-
-          git -C KernelSU fetch --all --tags --prune
-          git -C KernelSU checkout --detach "${{ inputs.resukisu_pin }}"
-
-          ACTUAL_SHA="$(git -C KernelSU rev-parse --short=8 HEAD)"
-          ACTUAL_FULL="$(git -C KernelSU rev-parse HEAD)"
-          ACTUAL_DATE="$(git -C KernelSU log -1 --format=%ci)"
-          KSU_TAG="$(git -C KernelSU describe --tags --abbrev=0 2>/dev/null || echo pinned)"
-
-          echo "Requested pin : ${{ inputs.resukisu_pin }}"
-          echo "Actual SHA    : ${ACTUAL_FULL}"
-          echo "Actual date   : ${ACTUAL_DATE}"
-          echo "Nearest tag   : ${KSU_TAG}"
-
-          case "$ACTUAL_FULL" in
-            "${{ inputs.resukisu_pin }}"*) ;;
-            *) echo "ERROR: ReSukiSU checkout does not match requested pin"; exit 1 ;;
-          esac
-
-          if [ -L drivers/kernelsu ]; then
-            test -d drivers/kernelsu || { echo "ERROR: drivers/kernelsu symlink is dangling"; exit 1; }
-          elif [ ! -d drivers/kernelsu ]; then
-            echo "ERROR: drivers/kernelsu is missing"
-            exit 1
-          fi
-
-          echo "KSU_SHA=${ACTUAL_SHA}" >> "$GITHUB_ENV"
-          echo "KSU_TAG=${KSU_TAG}" >> "$GITHUB_ENV"
-
-      - name: Remove yucca ROM gate from this independent build
-        run: |
-          echo "Yucca gate references before removal:"
-          grep -rnE 'YUCCA_ROM_GATE|early_assert|yucca_gate_token' \
-            drivers/ init/ kernel/ security/ fs/ 2>/dev/null || true
-
-          if grep -q 'early_assert' drivers/misc/Makefile 2>/dev/null; then
-            sed -i '/early_assert/d' drivers/misc/Makefile
-          fi
-          rm -f drivers/misc/early_assert.c
-
-          REMAINING="$(grep -rln 'yucca_gate_token' drivers/ init/ kernel/ security/ fs/ 2>/dev/null || true)"
-          if [ -n "$REMAINING" ]; then
-            echo "ERROR: yucca gate token consumers remain:"
-            echo "$REMAINING"
-            exit 1
-          fi
-          echo "Yucca gate source removed."
-
-      - name: Apply Super-Builders patches in recommended order
-        run: |
-          : > /tmp/fuzz_summary
-          mkdir -p /tmp/fuzzlogs
-          ROOT="$(pwd)"
-          SB_ABS="${ROOT}/${SB_DIR}"
-
-          apply_patch() {
-            local label="$1"
-            local patch_file="$2"
-            local workdir="${3:-$ROOT}"
-            local log="/tmp/fuzzlogs/${label}.log"
-            local rc=0 max_fuzz=0 lvl rejects
-
-            echo ""
-            echo "=================================================="
-            echo "Applying ${label}"
-            echo "Patch: ${patch_file}"
-            echo "Workdir: ${workdir}"
-            echo "=================================================="
-
-            test -f "$patch_file" || { echo "${label}:X:missing" >> /tmp/fuzz_summary; return 1; }
-            test -d "$workdir" || { echo "${label}:X:no-workdir" >> /tmp/fuzz_summary; return 1; }
-
-            touch "/tmp/${label}.timestamp"
-            pushd "$workdir" >/dev/null
-            patch -p1 --batch --forward --fuzz=3 --no-backup-if-mismatch \
-              < "$patch_file" 2>&1 | tee "$log"
-            rc=${PIPESTATUS[0]}
-            popd >/dev/null
-
-            if grep -qE "hunks? ignored|Skipping patch|can't find file to patch|No file to patch" "$log"; then
-              echo "${label}:X:skipped" >> /tmp/fuzz_summary
-              return 1
-            fi
-            if [ "$rc" -ne 0 ]; then
-              echo "${label}:X:failed" >> /tmp/fuzz_summary
-              return 1
-            fi
-
-            rejects="$(find "$workdir" -name '*.rej' -newer "/tmp/${label}.timestamp" 2>/dev/null || true)"
-            if [ -n "$rejects" ]; then
-              echo "$rejects"
-              echo "${label}:X:rejects" >> /tmp/fuzz_summary
-              return 1
-            fi
-
-            for lvl in 1 2 3; do
-              if grep -q "with fuzz ${lvl}" "$log"; then max_fuzz=$lvl; fi
-            done
-
-            if [ "$max_fuzz" -eq 0 ]; then
-              echo "${label}:0:clean" >> /tmp/fuzz_summary
-            else
-              echo "${label}:${max_fuzz}:fuzzed" >> /tmp/fuzz_summary
-            fi
-          }
-
-          P50="${SB_ABS}/50_add_susfs_in_gki-${ANDROID_VER}.patch"
-          P51="${SB_ABS}/51_enhanced_susfs-${ANDROID_VER}.patch"
-          P70="${SB_ABS}/70_ksu_safety-resukisu-5.15.patch"
-          P60="${SB_ABS}/60_zeromount-${ANDROID_VER}.patch"
-
-          # Same sequence shown by Super-Builders' ReSukiSU job.
-          apply_patch 50_susfs "$P50" "$ROOT" || exit 1
-          apply_patch 51_enhanced "$P51" "$ROOT" || exit 1
-
-          # 70_ contains kernel/supercalls.c relative to the KernelSU repository,
-          # so it must be applied from ${ROOT}/KernelSU rather than the kernel root.
-          apply_patch 70_ksu_safety "$P70" "${ROOT}/KernelSU" || exit 1
-          echo "KSU_SAFETY_OK=1" >> "$GITHUB_ENV"
-
-          apply_patch 60_zeromount "$P60" "$ROOT" || exit 1
-          echo "ZEROMOUNT_OK=1" >> "$GITHUB_ENV"
-
-          echo ""
-          echo "Patch summary:"
-          cat /tmp/fuzz_summary
-
-      - name: Audit hooks and required source files
-        run: |
-          echo "=================================================="
-          echo "HOOK AND SOURCE AUDIT"
-          echo "=================================================="
-
-          FAILED=0
-          CHECK_FILE="KernelSU/kernel/inline_hook_check.mk"
-
-          if [ -s "$CHECK_FILE" ]; then
-            echo "Selected ReSukiSU provides inline-hook checks:"
-            sed -n '1,220p' "$CHECK_FILE"
-
-            echo ""
-            echo "Checking only incompatibilities declared by this revision..."
-
-            # Extract symbols passed to check_ksu_hook_incompatible.
-            REJECTED_SYMBOLS="$(
-              grep -oE 'check_ksu_hook_incompatible,[A-Za-z0-9_]+' \
-                "$CHECK_FILE" 2>/dev/null \
-              | cut -d, -f2 \
-              | sort -u
-            )"
-
-            if [ -n "$REJECTED_SYMBOLS" ]; then
-              while read -r symbol; do
-                [ -n "$symbol" ] || continue
-
-                MATCHES="$(
-                  grep -rln -- "$symbol" \
-                    drivers/input/input.c \
-                    fs/exec.c \
-                    fs/open.c \
-                    fs/read_write.c \
-                    fs/stat.c \
-                    kernel/reboot.c \
-                    kernel/sys.c 2>/dev/null || true
-                )"
-
-                if [ -n "$MATCHES" ]; then
-                  echo "INCOMPATIBLE HOOK PRESENT: $symbol"
-                  echo "$MATCHES" | sed 's/^/  /'
-                  FAILED=1
-                else
-                  echo "OK rejected hook absent: $symbol"
-                fi
-              done <<< "$REJECTED_SYMBOLS"
-            else
-              echo "No rejected hook symbols declared."
-            fi
-          else
-            echo "This pinned ReSukiSU revision does not provide:"
-            echo "  $CHECK_FILE"
-            echo ""
-            echo "No newer-version incompatibility rules will be imposed."
-          fi
-
-          echo ""
-          echo "Verifying required patched sources..."
-
-          require_file() {
-            local file="$1"
-            if [ -f "$file" ]; then
-              echo "OK file: $file"
-            else
-              echo "MISSING FILE: $file"
-              FAILED=1
-            fi
-          }
-
-          require_pattern() {
-            local pattern="$1"
-            local file="$2"
-            if grep -q -- "$pattern" "$file" 2>/dev/null; then
-              echo "OK pattern '$pattern' in $file"
-            else
-              echo "MISSING pattern '$pattern' in $file"
-              FAILED=1
-            fi
-          }
-
-          require_file fs/susfs.c
-          require_file include/linux/susfs.h
-          require_file include/linux/susfs_def.h
-          require_file fs/zeromount.c
-          require_file include/linux/zeromount.h
-          require_file KernelSU/kernel/supercalls.c
-
-          require_pattern zeromount fs/Makefile
-          require_pattern ZEROMOUNT fs/Kconfig
-          require_pattern CMD_SUSFS_ADD_SUS_KSTAT_REDIRECT \
-            KernelSU/kernel/supercalls.c
-          require_pattern susfs_add_sus_kstat_redirect \
-            KernelSU/kernel/supercalls.c
-
-          echo ""
-          echo "Hook references present for diagnostic purposes:"
-          grep -rnE \
-            'ksu_(input_hook|execveat_hook|init_rc_hook|handle_input_handle_event|handle_execveat|handle_sys_read|handle_stat)' \
-            drivers/input/input.c fs/exec.c fs/read_write.c fs/stat.c \
-            2>/dev/null || true
-
-          if [ "$FAILED" -ne 0 ]; then
-            echo "ERROR: Revision-specific hook/source audit failed."
-            exit 1
-          fi
-
-          echo "Revision-specific hook/source audit passed."
-
-      - name: Enforce fuzz limit
-        run: |
-          WORST=0
-          FAILED=0
-
-          while IFS=: read -r label fuzz result; do
-            [ -n "$label" ] || continue
-            printf '%-20s %-8s %s\n' "$label" "$fuzz" "$result"
-            case "$fuzz" in
-              [0-3]) if [ "$fuzz" -gt "$WORST" ]; then WORST=$fuzz; fi ;;
-              *) FAILED=1 ;;
-            esac
-            case "$result" in
-              clean|fuzzed) ;;
-              *) FAILED=1 ;;
-            esac
-          done < /tmp/fuzz_summary
-
-          echo "Worst fuzz: ${WORST}"
-          echo "WORST_FUZZ=${WORST}" >> "$GITHUB_ENV"
-
-          if [ "$FAILED" -ne 0 ]; then
-            echo "ERROR: One or more patches failed"
-            exit 1
-          fi
-
-          MAX="${{ inputs.max_fuzz }}"
-          if [ "$MAX" != "99" ] && [ "$WORST" -gt "$MAX" ]; then
-            echo "ERROR: Worst fuzz ${WORST} exceeds limit ${MAX}"
-            exit 1
-          fi
-
-      - name: Stop after patch audit
-        if: inputs.patch_only
-        run: |
-          echo "patch_only=true"
-          echo "Pinned ReSukiSU: ${KSU_SHA}"
-          echo "Worst fuzz: ${WORST_FUZZ}"
-          echo "Patch and hook audits passed."
-
-      - name: Restore Clang cache
-        if: ${{ !inputs.patch_only }}
-        id: cache-clang
-        uses: actions/cache@v4
-        with:
-          path: clang-toolchain
-          key: exp7-clang-${{ env.CLANG_VERSION }}
-
-      - name: Download Clang on cache miss
-        if: ${{ !inputs.patch_only && steps.cache-clang.outputs.cache-hit != 'true' }}
-        run: |
-          curl -sSfL --retry 3 --connect-timeout 30 -o clang.tar.gz \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/mirror-goog-main-llvm-toolchain-source/clang-${CLANG_VERSION}.tar.gz"
-          mkdir -p clang-toolchain
-          tar -xf clang.tar.gz -C clang-toolchain
-          rm -f clang.tar.gz
-
-      - name: Set up swap
-        if: ${{ !inputs.patch_only }}
+      - name: Create swap
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 24
 
-      - name: Generate and configure defconfig
-        if: ${{ !inputs.patch_only }}
+      - name: Prepare AnyKernel3
+        shell: bash
         run: |
-          export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
-          make -j"$(nproc)" O=out ARCH=arm64 CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 gki_defconfig
+          set -euo pipefail
+          AK_ARCHIVE="${GITHUB_WORKSPACE}/packaging-source/.github/goodies/AnyKernel3.zip"
+          AK_DIR="${GITHUB_WORKSPACE}/kernel/anykernel3"
 
-          ./scripts/config --file out/.config -e CONFIG_KSU
-          ./scripts/config --file out/.config -e CONFIG_KSU_MANUAL_HOOK || true
+          test -s "$AK_ARCHIVE" || {
+            echo "::error::AnyKernel3 archive not found: $AK_ARCHIVE"
+            exit 1
+          }
 
-          # Enable every SUSFS symbol declared by the final assembled Kconfig.
-          grep -rhoE '^config KSU_SUSFS[A-Z_]*' fs/Kconfig drivers/kernelsu/Kconfig 2>/dev/null \
-            | sort -u | while read -r line; do
-                symbol="CONFIG_${line#config }"
-                echo "Enabling ${symbol}"
-                ./scripts/config --file out/.config -e "$symbol"
-              done
+          rm -rf "$AK_DIR"
+          mkdir -p "$AK_DIR"
+          unzip -q "$AK_ARCHIVE" -d "$AK_DIR"
 
-          ./scripts/config --file out/.config -e CONFIG_ZEROMOUNT
-          ./scripts/config --file out/.config -d LTO_NONE || true
-          ./scripts/config --file out/.config -e LTO_CLANG || true
-          ./scripts/config --file out/.config -e LTO_CLANG_THIN || true
-          ./scripts/config --file out/.config -d LTO_CLANG_FULL || true
-          ./scripts/config --file out/.config -e CFI_CLANG || true
-
-          make -j"$(nproc)" O=out ARCH=arm64 CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 olddefconfig
-
-      - name: Verify final config
-        if: ${{ !inputs.patch_only }}
-        run: |
-          CONFIG=out/.config
-          FAILED=0
-
-          require_config() {
-            local symbol="$1"
-            if grep -q "^${symbol}=y$" "$CONFIG"; then
-              echo "OK ${symbol}=y"
-            else
-              echo "MISSING ${symbol}=y"
-              FAILED=1
+          if [ ! -f "$AK_DIR/anykernel.sh" ]; then
+            WRAPPER="$(find "$AK_DIR" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+            if [ -n "$WRAPPER" ] && [ -f "$WRAPPER/anykernel.sh" ]; then
+              TMP="${GITHUB_WORKSPACE}/anykernel-flat"
+              rm -rf "$TMP"
+              mkdir -p "$TMP"
+              cp -a "$WRAPPER/." "$TMP/"
+              rm -rf "$AK_DIR"
+              mv "$TMP" "$AK_DIR"
             fi
+          fi
+
+          test -s "$AK_DIR/anykernel.sh" || { echo "::error::anykernel.sh missing"; exit 1; }
+          test -d "$AK_DIR/META-INF" || { echo "::error::META-INF missing"; exit 1; }
+          test -d "$AK_DIR/tools" || { echo "::error::tools missing"; exit 1; }
+
+          rm -rf "$AK_DIR/.git" "$AK_DIR/.github"
+          echo "ANYKERNEL_DIR=$AK_DIR" >> "$GITHUB_ENV"
+
+      - name: Disable Yucca token gate in build pipeline
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          ENTRY="scripts/build/build.sh"
+          test -f "$ENTRY" || {
+            echo "::error::Yucca build entrypoint missing: $ENTRY"
+            exit 1
           }
 
-          require_config CONFIG_KSU
-          require_config CONFIG_KSU_SUSFS
-          require_config CONFIG_KSU_SUSFS_SUS_KSTAT_REDIRECT
-          require_config CONFIG_ZEROMOUNT
-          require_config CONFIG_LTO_CLANG_THIN
-          require_config CONFIG_CFI_CLANG
+          echo "Gate-related source references before adjustment:"
+          grep -RInE 'Yucca gate|yucca_gate_token|early_assert|\.yucca_token' \
+            scripts drivers/misc 2>/dev/null || true
 
-          grep -E '^CONFIG_KSU_SUSFS[A-Z_]*=y$' "$CONFIG" || true
-          [ "$FAILED" -eq 0 ] || exit 1
+          # The native script performs clean-worktree checks before it generates
+          # the token. Insert the removal immediately after its unique
+          # "burnt into header" line, before feature patching and compilation.
+          TARGETS="$(grep -RIl 'burnt into header' scripts/build 2>/dev/null || true)"
+          COUNT="$(printf '%s\n' "$TARGETS" | sed '/^$/d' | wc -l)"
 
-      - name: Verify yucca gate remains disabled
-        if: ${{ !inputs.patch_only }}
-        run: |
-          test ! -f .yucca_token || { echo "ERROR: .yucca_token exists"; exit 1; }
-          ! grep -rq 'yucca_gate_token' drivers/ init/ kernel/ security/ fs/ \
-            || { echo "ERROR: yucca gate reference returned"; exit 1; }
-          echo "Yucca gate is absent."
-
-      - name: Build kernel
-        if: ${{ !inputs.patch_only }}
-        run: |
-          export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
-          make -j"$(nproc)" O=out ARCH=arm64 CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1
-
-      - name: Verify build outputs
-        if: ${{ !inputs.patch_only }}
-        run: |
-          FAILED=0
-          find out -name susfs.o -print -quit | grep -q . || { echo "Missing susfs.o"; FAILED=1; }
-          find out -name zeromount.o -print -quit | grep -q . || { echo "Missing zeromount.o"; FAILED=1; }
-          if ls out/arch/arm64/boot/Image* >/dev/null 2>&1; then
-            ls -la out/arch/arm64/boot/Image*
-          else
-            echo "Missing kernel Image"
-            FAILED=1
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::Expected one Yucca gate-generation script, found $COUNT"
+            printf '%s\n' "$TARGETS"
+            exit 1
           fi
-          [ "$FAILED" -eq 0 ] || exit 1
 
-      - name: Resolve metadata
-        if: ${{ !inputs.patch_only }}
-        id: meta
+          TARGET="$(printf '%s\n' "$TARGETS" | sed '/^$/d' | head -1)"
+          cp "$TARGET" "${TARGET}.original"
+
+          python3 - "$TARGET" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          lines = path.read_text().splitlines()
+          marker = "burnt into header"
+          matches = [i for i, line in enumerate(lines) if marker in line]
+          if len(matches) != 1:
+              raise SystemExit(f"expected one marker, found {len(matches)}")
+
+          i = matches[0]
+          indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+          injected = [
+              f'{indent}YUCCA_TREE="$(git rev-parse --show-toplevel)"',
+              f'{indent}echo "[*] Independent build: removing Yucca ROM token gate"',
+              f'{indent}sed -i \'/early_assert/d\' "$YUCCA_TREE/drivers/misc/Makefile"',
+              f'{indent}rm -f "$YUCCA_TREE/drivers/misc/early_assert.c"',
+              f'{indent}rm -f "$YUCCA_TREE/drivers/misc/yucca_gate_token.h"',
+              f'{indent}rm -f "$YUCCA_TREE/.yucca_token"',
+              f'{indent}if grep -q \'early_assert\' "$YUCCA_TREE/drivers/misc/Makefile"; then',
+              f'{indent}  echo "[-] Failed to remove early_assert from drivers/misc/Makefile"',
+              f'{indent}  exit 1',
+              f'{indent}fi',
+          ]
+          lines[i + 1:i + 1] = injected
+          path.write_text("\n".join(lines) + "\n")
+          PY
+
+          bash -n "$TARGET"
+          echo "Adjusted script: $TARGET"
+          grep -n -A12 -B2 'Independent build: removing Yucca ROM token gate' "$TARGET"
+
+      - name: Run native Yucca build
+        id: build
+        shell: bash
+        working-directory: kernel
+        env:
+          BUILD_MODE: ${{ inputs.mode }}
+          ANYKERNEL_DIR: ${{ env.ANYKERNEL_DIR }}
         run: |
-          echo "kernelversion=$(make kernelversion 2>/dev/null | awk -F. '{print $1"."$2"."$3}')" >> "$GITHUB_OUTPUT"
-          echo "date=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          set -o pipefail
+          chmod +x scripts/build/build.sh
+          ./scripts/build/build.sh "$BUILD_MODE" 2>&1 | tee "${GITHUB_WORKSPACE}/kernel-build.log"
 
-      - name: Package and validate flashable AnyKernel3 ZIP
-        if: ${{ !inputs.patch_only }}
+      - name: Verify token gate is absent from compiled output
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          OUT="out/${{ inputs.mode }}"
+          IMAGE="$OUT/arch/arm64/boot/Image"
+          REPORT="${GITHUB_WORKSPACE}/build-report.txt"
+
+          test -s "$IMAGE" || { echo "::error::Kernel Image missing"; exit 1; }
+
+          test ! -e .yucca_token || {
+            echo "::error::.yucca_token still exists"
+            exit 1
+          }
+
+          test ! -e drivers/misc/early_assert.c || {
+            echo "::error::early_assert.c still exists"
+            exit 1
+          }
+
+          if grep -q 'early_assert' drivers/misc/Makefile 2>/dev/null; then
+            echo "::error::early_assert remains in drivers/misc/Makefile"
+            exit 1
+          fi
+
+          if find "$OUT" -type f -name 'early_assert.o' -print -quit | grep -q .; then
+            echo "::error::early_assert.o was compiled"
+            exit 1
+          fi
+
+          if strings "$IMAGE" | grep -qE 'yucca_gate_token|YUCCA_ROM_GATE|early_assert'; then
+            echo "::error::Yucca gate marker found in compiled Image"
+            exit 1
+          fi
+
+          RESUKISU_CODE="$(grep -Eo 'ReSukiSU version code: [0-9]+' "${GITHUB_WORKSPACE}/kernel-build.log" | tail -1 | awk '{print $4}')"
+          RESUKISU_NAME="$(grep -E 'ReSukiSU version name:' "${GITHUB_WORKSPACE}/kernel-build.log" | tail -1 | sed 's/^.*ReSukiSU version name:[[:space:]]*//')"
+          SUSFS_VERSION="$(grep -E 'SUSFS_VERSION:' "${GITHUB_WORKSPACE}/kernel-build.log" | tail -1 | sed 's/^.*SUSFS_VERSION:[[:space:]]*//')"
+
+          {
+            echo "SM8550 BUILD REPORT"
+            echo "==================="
+            echo "Yucca source: $(git rev-parse HEAD)"
+            echo "Kernel version: $(make -s kernelversion)"
+            echo "ReSukiSU code: ${RESUKISU_CODE:-unknown}"
+            echo "ReSukiSU name: ${RESUKISU_NAME:-unknown}"
+            echo "SUSFS version: ${SUSFS_VERSION:-unknown}"
+            echo "Yucca token file: absent"
+            echo "early_assert source: absent"
+            echo "early_assert object: absent"
+            echo "Gate marker in Image: absent"
+          } | tee "$REPORT"
+
+      - name: Select and validate flashable ZIP
         id: package
+        shell: bash
+        working-directory: kernel
         run: |
-          set -e
+          set -euo pipefail
+          OUT="out/${{ inputs.mode }}"
+          ZIP_PATH="$(find "$OUT" -maxdepth 1 -type f -name 'SM8550_*.zip' -print -quit)"
 
-          AK_SOURCE=".own-repo/.github/goodies/AnyKernel3.zip"
-          PACKAGE_DIR="${GITHUB_WORKSPACE}/AnyKernel3"
-          ZIP_BASENAME="EXP7.1-sm8550-${{ steps.meta.outputs.kernelversion }}-ReSukiSU-${KSU_SHA}-ZeroMount-fuzz${WORST_FUZZ}-${{ steps.meta.outputs.date }}"
-          ZIP_PATH="${GITHUB_WORKSPACE}/${ZIP_BASENAME}.zip"
-
-          echo "==> Preparing AnyKernel3 package..."
-
-          test -s "$AK_SOURCE" || {
-            echo "::error::AnyKernel3 template not found: $AK_SOURCE"
+          test -n "$ZIP_PATH" && test -s "$ZIP_PATH" || {
+            echo "::error::Flashable ZIP not found under $OUT"
+            find "$OUT" -maxdepth 3 -type f -print | sort
             exit 1
           }
 
-          rm -rf "$PACKAGE_DIR"
-          mkdir -p "$PACKAGE_DIR"
-          unzip -q "$AK_SOURCE" -d "$PACKAGE_DIR"
-
-          # Remove metadata and any kernel images inherited from the template.
-          rm -rf \
-            "$PACKAGE_DIR/.git" \
-            "$PACKAGE_DIR/.github"
-
-          find "$PACKAGE_DIR" -maxdepth 1 -type f \
-            \( -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" \) \
-            -delete
-
-          # Prefer Image.gz when generated; otherwise use raw Image.
-          if [ -s out/arch/arm64/boot/Image.gz ]; then
-            cp out/arch/arm64/boot/Image.gz "$PACKAGE_DIR/Image.gz"
-            KERNEL_ENTRY="Image.gz"
-          elif [ -s out/arch/arm64/boot/Image ]; then
-            cp out/arch/arm64/boot/Image "$PACKAGE_DIR/Image"
-            KERNEL_ENTRY="Image"
-          else
-            echo "::error::No compiled kernel image was found."
-            exit 1
-          fi
-
-          cat > "$PACKAGE_DIR/CHANGELOG.txt" <<EOF
-          SM8550 EXP7.1
-          Kernel: ${{ steps.meta.outputs.kernelversion }}
-          Kernel source: ${KERNEL_REPO}@${KERNEL_REF}
-          ReSukiSU pin: ${{ inputs.resukisu_pin }} (${KSU_SHA})
-          Super-Builders: ${SB_COMMIT}
-          ZeroMount: ${ZEROMOUNT_OK:-0}
-          KSU safety patch: ${KSU_SAFETY_OK:-0}
-          Worst fuzz: ${WORST_FUZZ}
-          EOF
-
-          echo "==> Validating package directory..."
-
-          test -s "$PACKAGE_DIR/anykernel.sh" || {
-            echo "::error::anykernel.sh is missing."
-            exit 1
-          }
-
-          test -d "$PACKAGE_DIR/META-INF" || {
-            echo "::error::META-INF is missing."
-            exit 1
-          }
-
-          test -d "$PACKAGE_DIR/tools" || {
-            echo "::error::AnyKernel3 tools directory is missing."
-            exit 1
-          }
-
-          test -s "$PACKAGE_DIR/$KERNEL_ENTRY" || {
-            echo "::error::Kernel entry is missing or empty."
-            exit 1
-          }
-
-          echo "==> Creating recovery-flashable ZIP..."
-
-          (
-            cd "$PACKAGE_DIR"
-            zip -r9 "$ZIP_PATH" . \
-              -x ".git/*" \
-                 ".github/*" \
-                 "*.zip"
-          )
-
-          echo "==> Testing ZIP integrity..."
           unzip -t "$ZIP_PATH"
+          unzip -Z1 "$ZIP_PATH" | grep -qx 'anykernel.sh' || { echo "::error::anykernel.sh not at ZIP root"; exit 1; }
+          unzip -Z1 "$ZIP_PATH" | grep -q '^META-INF/' || { echo "::error::META-INF missing"; exit 1; }
+          unzip -Z1 "$ZIP_PATH" | grep -q '^tools/' || { echo "::error::tools missing"; exit 1; }
+          unzip -Z1 "$ZIP_PATH" | grep -Eq '^(Image|Image.gz|Image.gz-dtb)$' || { echo "::error::kernel Image missing"; exit 1; }
 
-          echo "==> Checking required ZIP entries..."
-          unzip -Z1 "$ZIP_PATH" | grep -qx "anykernel.sh" || {
-            echo "::error::anykernel.sh is not at the ZIP root."
-            exit 1
-          }
+          ZIP_ABS="$(realpath "$ZIP_PATH")"
+          ZIP_NAME="$(basename "$ZIP_PATH" .zip)"
+          echo "zip_path=$ZIP_ABS" >> "$GITHUB_OUTPUT"
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "Validated flashable ZIP: $ZIP_ABS"
+          ls -lh "$ZIP_ABS"
 
-          unzip -Z1 "$ZIP_PATH" | grep -q "^META-INF/" || {
-            echo "::error::META-INF is not at the ZIP root."
-            exit 1
-          }
-
-          unzip -Z1 "$ZIP_PATH" | grep -q "^tools/" || {
-            echo "::error::tools is not at the ZIP root."
-            exit 1
-          }
-
-          unzip -Z1 "$ZIP_PATH" | grep -qx "$KERNEL_ENTRY" || {
-            echo "::error::$KERNEL_ENTRY is not at the ZIP root."
-            exit 1
-          }
-
-          echo "==> Flashable ZIP created:"
-          ls -lh "$ZIP_PATH"
-
-          echo "zip_name=${ZIP_BASENAME}" >> "$GITHUB_OUTPUT"
-          echo "zip_path=${ZIP_PATH}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload flashable AnyKernel3 ZIP
-        if: ${{ !inputs.patch_only }}
+      - name: Upload flashable ZIP only
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.zip_name }}
@@ -622,17 +275,19 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-      - name: Build summary
-        if: always()
-        run: |
-          {
-            echo "## EXP7.1 pinned build"
-            echo ""
-            echo "- Kernel source: \`${KERNEL_REPO}@${KERNEL_REF}\`"
-            echo "- Requested ReSukiSU pin: \`${{ inputs.resukisu_pin }}\`"
-            echo "- Actual ReSukiSU SHA: \`${KSU_SHA:-n/a}\`"
-            echo "- Super-Builders SHA: \`${SB_COMMIT}\`"
-            echo "- ZeroMount: \`${ZEROMOUNT_OK:-0}\`"
-            echo "- KSU safety patch: \`${KSU_SAFETY_OK:-0}\`"
-            echo "- Worst fuzz: \`${WORST_FUZZ:-n/a}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload compact build report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.zip_name }}-report
+          path: build-report.txt
+          compression-level: 9
+          if-no-files-found: error
+
+      - name: Upload log only if build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sm8550-failed-build-log-${{ github.run_number }}
+          path: kernel-build.log
+          compression-level: 9
+          if-no-files-found: warn
