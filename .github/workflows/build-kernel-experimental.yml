@@ -1,4 +1,4 @@
-name: Test SM8550 ReSukiSU + Low-Fuzz ZeroMount + ThinLTO
+name: Test SM8550 ReSukiSU + Yucca-Style ZeroMount + ThinLTO
 
 on:
   workflow_dispatch:
@@ -562,138 +562,215 @@ jobs:
 
           rm -rf susfs4ksu
 
-      - name: Apply ZeroMount with strict low-fuzz validation
+      - name: Apply ZeroMount using Yucca integration method
         run: |
           set -euo pipefail
 
           echo "=================================================="
-          echo "  ZEROMOUNT LOW-FUZZ TEST"
+          echo "  YUCCA-STYLE ZEROMOUNT INTEGRATION"
           echo "=================================================="
-          echo "Keeping the existing ReSukiSU, SUSFS, and AK3 pipeline."
-          echo "Testing only the pinned Super-Builders ZeroMount patch."
+          echo "Keeping the existing ReSukiSU, SUSFS, and AnyKernel3 pipeline."
+          echo "Using Super-Builders only for the pinned 60_ ZeroMount patch."
 
           git clone --quiet "${SUPER_BUILDERS_REPO}" super-builders
           git -C super-builders checkout --quiet "${SUPER_BUILDERS_COMMIT}"
 
           PATCH_FILE="super-builders/${ZERO_MOUNT_PATCH}"
           PATCH_LOG="/tmp/zeromount.patch.log"
-          DRY_LOG="/tmp/zeromount.dry-run.log"
+          C89_PATCH="/tmp/zeromount-stat-c89.patch"
 
           test -s "$PATCH_FILE" || {
-            echo "::error::ZeroMount patch not found: $PATCH_FILE"
-            find super-builders/android13-5.15 -maxdepth 5 \
-              -type f -name '*zeromount*.patch' -print || true
+            echo "::error::ZeroMount patch missing: $PATCH_FILE"
             exit 1
           }
 
           echo "Super-Builders SHA: $(git -C super-builders rev-parse HEAD)"
-          echo "Patch: $PATCH_FILE"
+          echo "ZeroMount patch: $PATCH_FILE"
 
-          find . -type f -name '*.rej' -delete
-          rm -f "$PATCH_LOG" "$DRY_LOG"
+          zeromount_core_present() {
+            [ -s fs/zeromount.c ] &&
+            [ -s include/linux/zeromount.h ] &&
+            grep -q 'config ZEROMOUNT' fs/Kconfig &&
+            grep -q 'CONFIG_ZEROMOUNT' fs/Makefile &&
+            grep -q 'zeromount_getname_hook' fs/namei.c &&
+            grep -q 'zeromount_inject_dents' fs/readdir.c
+          }
 
-          echo "==> Testing ZeroMount at fuzz 0..."
-          if patch -p1 --batch --forward --fuzz=0 --dry-run \
-               < "$PATCH_FILE" > "$DRY_LOG" 2>&1; then
-            APPLY_FUZZ=0
+          find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
+          rm -f "$PATCH_LOG"
+
+          # Match Yucca's logic exactly:
+          # 1. Detect an already-applied patch with a reverse dry run at F3.
+          # 2. Otherwise apply with GNU patch, -F3, quiet output, and no backups.
+          if zeromount_core_present; then
+            echo "==> ZeroMount core is already present."
+          elif /usr/bin/patch -p1 -R --dry-run -F3 -s -f \
+                 --no-backup-if-mismatch < "$PATCH_FILE" >/dev/null 2>&1; then
+            echo "==> ZeroMount patch is already applied."
           else
-            echo "==> Fuzz 0 did not apply cleanly. Testing fuzz 1..."
-            if patch -p1 --batch --forward --fuzz=1 --dry-run \
-                 < "$PATCH_FILE" > "$DRY_LOG" 2>&1; then
-              APPLY_FUZZ=1
-            else
-              echo ""
-              echo "::error::ZeroMount cannot be applied safely at fuzz 0 or 1."
-              echo "::error::This test intentionally refuses fuzz 2 or 3."
-              echo "--- dry-run output ---"
-              cat "$DRY_LOG"
-              echo "--- end dry-run output ---"
+            set +e
+            /usr/bin/patch -p1 -F3 --no-backup-if-mismatch \
+              < "$PATCH_FILE" 2>&1 | tee "$PATCH_LOG"
+            PATCH_RC=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$PATCH_RC" -ne 0 ]; then
+              echo "::error::Yucca-style ZeroMount patch application failed."
+              find . -type f -name '*.rej' -print -exec sed -n '1,100p' {} \;
               exit 1
             fi
           fi
 
-          echo "==> Applying ZeroMount at fuzz ${APPLY_FUZZ}..."
-          set +e
-          patch -p1 --batch --forward --fuzz="${APPLY_FUZZ}" \
-            --no-backup-if-mismatch < "$PATCH_FILE" 2>&1 | tee "$PATCH_LOG"
-          PATCH_RC=${PIPESTATUS[0]}
-          set -e
+          echo "==> Applying Yucca task_mmu metadata-hook correction..."
+          python3 - <<'PY'
+          import pathlib
+          import sys
 
-          if [ "$PATCH_RC" -ne 0 ]; then
-            echo "::error::ZeroMount patch returned exit code ${PATCH_RC}."
-            exit 1
+          p = pathlib.Path('fs/proc/task_mmu.c')
+          if not p.exists():
+              raise SystemExit('fs/proc/task_mmu.c is missing')
+
+          lines = p.read_text().splitlines(keepends=True)
+          clean = []
+          i = 0
+
+          # Remove every existing copy of this exact three-line hook first.
+          while i < len(lines):
+              if (
+                  lines[i].strip() == '#ifdef CONFIG_ZEROMOUNT'
+                  and i + 2 < len(lines)
+                  and 'zeromount_spoof_mmap_metadata(inode, &dev, &ino);' in lines[i + 1]
+                  and lines[i + 2].strip() == '#endif'
+              ):
+                  i += 3
+                  continue
+              clean.append(lines[i])
+              i += 1
+
+          hook = [
+              '#ifdef CONFIG_ZEROMOUNT\n',
+              '\t\tzeromount_spoof_mmap_metadata(inode, &dev, &ino);\n',
+              '#endif\n',
+          ]
+
+          for start, line in enumerate(clean):
+              if line.startswith('\tif (file) {'):
+                  for end in range(start + 1, len(clean)):
+                      if clean[end].startswith('\t}'):
+                          block = ''.join(clean[start:end])
+                          if (
+                              'struct inode *inode' in block
+                              and 'dev = inode->i_sb->s_dev;' in block
+                              and 'ino = inode->i_ino;' in block
+                          ):
+                              clean[end:end] = hook
+                              p.write_text(''.join(clean))
+                              print('ZeroMount task_mmu metadata hook fixed.')
+                              sys.exit(0)
+                          break
+
+          raise SystemExit(
+              'ZeroMount task_mmu fixup failed: file-backed VMA block not found'
+          )
+          PY
+
+          # Exact Yucca C89 compatibility patch. It moves fname to the
+          # declaration section before the ZeroMount executable statements.
+          cat > "$C89_PATCH" <<'PATCH'
+          diff --git a/fs/stat.c b/fs/stat.c
+          index c9af377..17fd32c 100644
+          --- a/fs/stat.c
+          +++ b/fs/stat.c
+          @@ -285,6 +285,7 @@ static int vfs_statx(int dfd, const char __user *filename, int flags,
+           	unsigned lookup_flags = 0;
+           	int error;
+           #ifdef CONFIG_KSU_SUSFS
+          +	struct filename *fname = NULL;
+           #ifdef CONFIG_ZEROMOUNT
+           	/* Try ZeroMount hook for relative paths */
+           	if (filename) {
+          @@ -293,9 +294,6 @@ static int vfs_statx(int dfd, const char __user *filename, int flags,
+           			return zm_ret;
+           	}
+           #endif
+          -
+          -
+          -	struct filename *fname = NULL;
+           #endif
+
+           	if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH |
+          PATCH
+          sed -i 's/^          //' "$C89_PATCH"
+
+          echo "==> Applying Yucca zeromount-stat-c89 compatibility patch..."
+          if /usr/bin/patch -p1 -R --forward --dry-run --batch --fuzz=0 \
+               < "$C89_PATCH" >/dev/null 2>&1; then
+            echo "==> C89 compatibility patch is already applied."
+          else
+            /usr/bin/patch -p1 --forward --batch --fuzz=0 \
+              --no-backup-if-mismatch < "$C89_PATCH"
           fi
 
-          if grep -qE \
-               "with fuzz [2-9]|hunks? ignored|Skipping patch|can't find file to patch|No file to patch|FAILED" \
-               "$PATCH_LOG"; then
-            echo "::error::ZeroMount produced a skipped, failed, or excessive-fuzz hunk."
-            grep -nE \
-              "with fuzz [2-9]|hunks? ignored|Skipping patch|can't find file to patch|No file to patch|FAILED" \
-              "$PATCH_LOG" || true
-            exit 1
-          fi
-
+          # Reject unresolved patch output after both Yucca fixups.
           REJECTS="$(find . -type f -name '*.rej' -print)"
           if [ -n "$REJECTS" ]; then
-            echo "::error::ZeroMount reject files were created:"
+            echo "::error::ZeroMount reject files remain after Yucca fixups:"
             printf '%s\n' "$REJECTS"
             exit 1
           fi
 
-          test -s fs/zeromount.c || {
-            echo "::error::fs/zeromount.c is missing."
-            exit 1
-          }
-          test -s include/linux/zeromount.h || {
-            echo "::error::include/linux/zeromount.h is missing."
-            exit 1
-          }
-          grep -q 'zeromount' fs/Makefile || {
-            echo "::error::fs/Makefile has no ZeroMount entry."
-            exit 1
-          }
-          grep -q 'ZEROMOUNT' fs/Kconfig || {
-            echo "::error::fs/Kconfig has no CONFIG_ZEROMOUNT entry."
+          # Core and placement checks from Yucca's integration.
+          zeromount_core_present || {
+            echo "::error::ZeroMount core verification failed."
             exit 1
           }
 
-          # The previous fuzz-3 build placed a declaration after executable
-          # code in fs/stat.c. Reject that exact malformed result before compile.
+          HOOK_COUNT="$(grep -c 'zeromount_spoof_mmap_metadata(inode, &dev, &ino);' \
+            fs/proc/task_mmu.c || true)"
+          [ "$HOOK_COUNT" = "1" ] || {
+            echo "::error::Expected one task_mmu metadata hook, found $HOOK_COUNT."
+            exit 1
+          }
+
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
-          path = Path('fs/stat.c')
-          lines = path.read_text().splitlines()
-          declaration = re.compile(r'^\s*struct\s+filename\s*\*\s*fname\s*=\s*NULL\s*;')
+          p = Path('fs/stat.c')
+          lines = p.read_text().splitlines()
+          decl = [i for i, line in enumerate(lines)
+                  if 'struct filename *fname = NULL;' in line]
+          hook = [i for i, line in enumerate(lines)
+                  if 'zeromount_getname_hook' in line]
 
-          for index, line in enumerate(lines):
-              if not declaration.search(line):
-                  continue
-              start = max(0, index - 24)
-              context = lines[start:index]
-              statement_seen = False
-              for previous in context:
-                  stripped = previous.strip()
-                  if not stripped or stripped.startswith(('#', '/*', '*', '//')):
-                      continue
-                  if stripped.endswith((';', '{')) and not re.match(
-                      r'^(struct|union|enum|const|unsigned|signed|int|long|short|bool|char|void|size_t|umode_t|uid_t|gid_t)\b',
-                      stripped,
-                  ):
-                      statement_seen = True
-              if statement_seen:
-                  print(f'Unsafe late declaration at fs/stat.c:{index + 1}: {line}')
-                  raise SystemExit(1)
+          if len(decl) != 1:
+              raise SystemExit(
+                  f'Expected one fname declaration in fs/stat.c, found {len(decl)}'
+              )
+          if not hook:
+              raise SystemExit('ZeroMount getname hook missing from fs/stat.c')
+          if decl[0] > hook[0]:
+              raise SystemExit(
+                  'fname declaration remains after ZeroMount executable code'
+              )
 
-          print('fs/stat.c ZeroMount declaration placement check passed.')
+          print('fs/stat.c C89 declaration placement verified.')
           PY
 
-          echo "ZEROMOUNT_ENABLED=1" >> "$GITHUB_ENV"
-          echo "ZEROMOUNT_MAX_FUZZ=${APPLY_FUZZ}" >> "$GITHUB_ENV"
-          echo "==> ZeroMount applied successfully at fuzz ${APPLY_FUZZ}."
+          MAX_FUZZ=0
+          if [ -s "$PATCH_LOG" ]; then
+            for level in 1 2 3; do
+              if grep -q "with fuzz ${level}" "$PATCH_LOG"; then
+                MAX_FUZZ=$level
+              fi
+            done
+          fi
 
+          echo "ZEROMOUNT_ENABLED=1" >> "$GITHUB_ENV"
+          echo "ZEROMOUNT_MAX_FUZZ=${MAX_FUZZ}" >> "$GITHUB_ENV"
+          echo "==> Yucca-style ZeroMount integration passed."
+          echo "==> Main patch maximum fuzz: ${MAX_FUZZ}; explicit fixups verified."
+
+          find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
           rm -rf super-builders
 
       - name: Resolve kernel version and date
@@ -1007,13 +1084,13 @@ jobs:
           echo "========================================================"
           echo "  VERDICT: ${FLASH_PRIORITY}"
           echo ""
-          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-lowfuzz-thinlto-test-${{ steps.meta.outputs.date }}"
+          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-yucca-zeromount-thinlto-test-${{ steps.meta.outputs.date }}"
           echo "========================================================"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-lowfuzz-thinlto-test-${{ steps.meta.outputs.date }}
+          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-yucca-zeromount-thinlto-test-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
           if-no-files-found: warn
@@ -1055,7 +1132,7 @@ jobs:
           fi
 
           VARIANT="${{ matrix.display_name }}"
-          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-lowfuzz-thinlto-test-${{ steps.meta.outputs.date }}"
+          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-yucca-zeromount-thinlto-test-${{ steps.meta.outputs.date }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Build the JSON payload
