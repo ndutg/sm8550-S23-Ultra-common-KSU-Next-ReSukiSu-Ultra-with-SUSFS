@@ -1,0 +1,21 @@
+      - name: Build, validate and package Yucca current stack
+        run: |
+          chmod +x scripts/ci/test-yucca-current.sh
+          ./scripts/ci/test-yucca-current.sh resukisu
+
+      - name: Upload Yucca component report
+        uses: actions/upload-artifact@v4
+        with:
+          name: yucca-component-report
+          path: |
+            yucca-component-report.txt
+            yucca-current-build.log
+          if-no-files-found: error
+
+      - name: Upload flashable Yucca ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: yucca-resukisu-flashable
+          path: flashable-output/*.zip
+          compression-level: 0
+          if-no-files-found: error
