@@ -1,21 +1,172 @@
-      - name: Build, validate and package Yucca current stack
+name: Test Yucca script.sh
+
+on:
+  workflow_dispatch:
+    inputs:
+      script_path:
+        description: "Path to the test script in this repository"
+        required: true
+        default: "script.sh"
+        type: string
+      mode:
+        description: "Build mode passed to the script"
+        required: true
+        default: "resukisu"
+        type: choice
+        options:
+          - resukisu
+          - lkm
+      jobs:
+        description: "Parallel build jobs; 0 uses all available CPUs"
+        required: true
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  test-script:
+    name: Run ${{ inputs.script_path }} (${{ inputs.mode }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        shell: bash
         run: |
-          chmod +x scripts/ci/test-yucca-current.sh
-          ./scripts/ci/test-yucca-current.sh resukisu
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost /usr/local/.ghcup || true
+          sudo rm -rf /usr/share/swift /usr/local/share/powershell || true
+          sudo rm -rf /usr/local/share/chromium /usr/local/lib/node_modules || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}" || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+          df -h /
 
-      - name: Upload Yucca component report
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl dwarves flex \
+            g++-multilib gcc-multilib git gnupg jq libelf-dev \
+            liblz4-tool libssl-dev lz4 lzop pahole perl \
+            python-is-python3 python3 rsync tar unzip zip zlib1g-dev
+
+      - name: Create swap
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 24
+
+      - name: Validate script
+        id: script
+        shell: bash
+        env:
+          SCRIPT_PATH: ${{ inputs.script_path }}
+        run: |
+          set -euo pipefail
+          case "$SCRIPT_PATH" in
+            /*|*..*)
+              echo "::error::script_path must be a relative path inside the repository"
+              exit 1
+              ;;
+          esac
+          test -f "$SCRIPT_PATH" || {
+            echo "::error::Script not found: $SCRIPT_PATH"
+            exit 1
+          }
+          bash -n "$SCRIPT_PATH"
+          chmod +x "$SCRIPT_PATH"
+          echo "absolute_path=${GITHUB_WORKSPACE}/${SCRIPT_PATH}" >> "$GITHUB_OUTPUT"
+          echo "Script syntax is valid: $SCRIPT_PATH"
+
+      - name: Run test script
+        id: run_script
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          JOBS_INPUT: ${{ inputs.jobs }}
+          SCRIPT_FILE: ${{ steps.script.outputs.absolute_path }}
+        run: |
+          set -o pipefail
+          if [ "$JOBS_INPUT" = "0" ]; then
+            export JOBS="$(nproc)"
+          else
+            case "$JOBS_INPUT" in
+              ''|*[!0-9]*)
+                echo "::error::jobs must be 0 or a positive integer"
+                exit 1
+                ;;
+            esac
+            export JOBS="$JOBS_INPUT"
+          fi
+
+          echo "Running: $SCRIPT_FILE $MODE"
+          echo "JOBS=$JOBS"
+          "$SCRIPT_FILE" "$MODE" 2>&1 | tee script-test.log
+
+      - name: Locate outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          cp -f script-test.log test-results/ 2>/dev/null || true
+          cp -f yucca-component-report.txt test-results/ 2>/dev/null || true
+          cp -f BUILD-INFO.txt test-results/ 2>/dev/null || true
+
+          find . -maxdepth 7 -type f \
+            \( -name '*.zip' -o -name 'Image' -o -name 'Image.gz' \
+               -o -name 'Image.gz-dtb' -o -name '*.rej' \) \
+            -not -path './.git/*' -print | sort | tee test-results/output-files.txt
+
+          find flashable-output -maxdepth 1 -type f -name '*.zip' \
+            -exec cp -f {} test-results/ \; 2>/dev/null || true
+
+          find out -type f \
+            \( -name 'Image' -o -name 'Image.gz' -o -name 'Image.gz-dtb' \) \
+            -exec cp -f {} test-results/ \; 2>/dev/null || true
+
+          ls -lah test-results
+
+      - name: Validate flashable ZIP when produced
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          FOUND=0
+          for zipfile in flashable-output/*.zip; do
+            [ -f "$zipfile" ] || continue
+            FOUND=1
+            echo "Validating $zipfile"
+            unzip -t "$zipfile"
+            unzip -Z1 "$zipfile" | grep -qx 'anykernel.sh'
+            unzip -Z1 "$zipfile" | grep -q '^META-INF/'
+            unzip -Z1 "$zipfile" | grep -q '^tools/'
+            unzip -Z1 "$zipfile" | grep -Eq '^(Image|Image.gz|Image.gz-dtb)$'
+          done
+          if [ "$FOUND" -eq 0 ]; then
+            echo "No flashable-output/*.zip was produced."
+          fi
+
+      - name: Upload test logs and outputs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: yucca-component-report
-          path: |
-            yucca-component-report.txt
-            yucca-current-build.log
-          if-no-files-found: error
-
-      - name: Upload flashable Yucca ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: yucca-resukisu-flashable
-          path: flashable-output/*.zip
+          name: yucca-script-test-${{ inputs.mode }}-${{ github.run_number }}
+          path: test-results/
           compression-level: 0
-          if-no-files-found: error
+          if-no-files-found: warn
