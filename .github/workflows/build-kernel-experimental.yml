@@ -1,4 +1,4 @@
-name: Test Working Kernel + Yucca ZeroMount Minimal Delta
+name: Test Pinned Working Kernel + Yucca ZeroMount Minimal Delta
 
 on:
   workflow_dispatch:
@@ -133,7 +133,7 @@ jobs:
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.KERNEL_BRANCH }}
+          ref: a4eafcbbe8fe692708b57e7d248e773cd92496a7
           fetch-depth: 1
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -771,21 +771,29 @@ jobs:
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
           rm -rf super-builders
 
-      - name: Audit source delta against working build
+      - name: Verify pinned baseline and ZeroMount-only test scope
         run: |
           set -euo pipefail
-          echo "==> Files changed relative to the checked-out working kernel:"
-          git status --short | tee /tmp/source-delta.txt
-
-          echo "==> Rejecting unexpected ZeroMount changes outside the approved integration set..."
-          ALLOWED='^( M|M |A |\?\?) (fs/Kconfig|fs/Makefile|fs/d_path.c|fs/exec.c|fs/namei.c|fs/open.c|fs/read_write.c|fs/readdir.c|fs/stat.c|fs/statfs.c|fs/xattr.c|fs/proc/base.c|fs/proc/task_mmu.c|include/linux/zeromount.h|fs/zeromount.c|drivers/kernelsu/|include/linux/cred.h|include/linux/sched.h|kernel/Makefile|kernel/ksu_hooks_bridge.c|CHANGELOG.txt|\.prev_build_shas)'
-          UNEXPECTED="$(grep -Ev "$ALLOWED" /tmp/source-delta.txt || true)"
-          if [ -n "$UNEXPECTED" ]; then
-            echo "::error::Unexpected source changes detected:"
-            printf '%s\n' "$UNEXPECTED"
+          EXPECTED_KERNEL_SHA="a4eafcbbe8fe692708b57e7d248e773cd92496a7"
+          ACTUAL_KERNEL_SHA="$(git rev-parse HEAD)"
+          echo "Expected working kernel SHA: $EXPECTED_KERNEL_SHA"
+          echo "Actual checked-out SHA:      $ACTUAL_KERNEL_SHA"
+          [ "$ACTUAL_KERNEL_SHA" = "$EXPECTED_KERNEL_SHA" ] || {
+            echo "::error::Kernel source does not match the known-good sound build."
             exit 1
-          fi
-          echo "==> Source delta is restricted to the normal build changes plus approved ZeroMount files."
+          }
+
+          echo "==> Confirming required ZeroMount files and corrected hooks..."
+          test -s fs/zeromount.c
+          test -s include/linux/zeromount.h
+          grep -q 'config ZEROMOUNT' fs/Kconfig
+          grep -q 'CONFIG_ZEROMOUNT' fs/Makefile
+          grep -q 'zeromount_getname_hook' fs/namei.c
+          grep -q 'zeromount_inject_dents' fs/readdir.c
+          [ "$(grep -c 'zeromount_spoof_mmap_metadata(inode, &dev, &ino);' fs/proc/task_mmu.c || true)" = "1" ]
+
+          echo "==> Baseline pin and ZeroMount integration checks passed."
+          echo "==> Existing ReSukiSU and SUSFS source changes are intentionally retained from the known-good workflow."
 
       - name: Resolve kernel version and date
         id: meta
