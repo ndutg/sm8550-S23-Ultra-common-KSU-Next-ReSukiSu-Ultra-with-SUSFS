@@ -1,4 +1,4 @@
-name: Test SM8550 ReSukiSU + Yucca ZeroMount + ThinLTO v2
+name: Test SM8550 ReSukiSU + Yucca ZeroMount + Normal LTO
 
 on:
   workflow_dispatch:
@@ -9,10 +9,6 @@ on:
         default: false
       build_resukisu:
         description: "Build ReSukiSU (main)"
-        type: boolean
-        default: true
-      enable_thin_lto:
-        description: "Enable Clang ThinLTO for this test build"
         type: boolean
         default: true
 
@@ -815,15 +811,6 @@ jobs:
             ./scripts/config --file out/.config -e CONFIG_ZEROMOUNT
           fi
 
-          if [ "${{ inputs.enable_thin_lto }}" = "true" ]; then
-            echo "==> Enabling Clang ThinLTO test configuration..."
-            ./scripts/config --file out/.config -d CONFIG_LTO_NONE
-            ./scripts/config --file out/.config -e CONFIG_LTO
-            ./scripts/config --file out/.config -e CONFIG_LTO_CLANG
-            ./scripts/config --file out/.config -e CONFIG_LTO_CLANG_THIN
-            ./scripts/config --file out/.config -d CONFIG_LTO_CLANG_FULL
-          fi
-
           # Enable manual hook if this variant uses it
           if [ "${{ matrix.use_manual_hook }}" = "true" ]; then
             echo "==> Enabling manual hook mode..."
@@ -863,25 +850,23 @@ jobs:
               FAILED=1
             fi
           fi
-          if [ "${{ inputs.enable_thin_lto }}" = "true" ]; then
-            echo "  --- ThinLTO test configuration ---"
-            for OPT in CONFIG_LTO CONFIG_LTO_CLANG CONFIG_LTO_CLANG_THIN; do
-              if grep -q "^${OPT}=y$" "$CONFIG"; then
-                echo "  ✅ ${OPT}=y"
-              else
-                echo "  ❌ ${OPT}=y is MISSING!"
-                FAILED=1
-              fi
-            done
-            if grep -q '^CONFIG_LTO_CLANG_FULL=y$' "$CONFIG"; then
-              echo "  ❌ CONFIG_LTO_CLANG_FULL must not be enabled"
-              FAILED=1
-            fi
-            if grep -q '^CONFIG_LTO_NONE=y$' "$CONFIG"; then
-              echo "  ❌ CONFIG_LTO_NONE must not be enabled"
-              FAILED=1
-            fi
+          echo "  --- Original kernel LTO configuration ---"
+          LTO_MODE="unknown"
+          if grep -q '^CONFIG_LTO_CLANG_FULL=y$' "$CONFIG"; then
+            LTO_MODE="full"
+            echo "  ✅ Original Full LTO retained: CONFIG_LTO_CLANG_FULL=y"
+          elif grep -q '^CONFIG_LTO_CLANG_THIN=y$' "$CONFIG"; then
+            LTO_MODE="thin"
+            echo "  ✅ Original ThinLTO retained: CONFIG_LTO_CLANG_THIN=y"
+          elif grep -q '^CONFIG_LTO_NONE=y$' "$CONFIG"; then
+            LTO_MODE="none"
+            echo "  ✅ Original no-LTO configuration retained: CONFIG_LTO_NONE=y"
+          else
+            echo "  ℹ️  No explicit LTO mode symbol found; kernel defaults were left untouched."
           fi
+          echo "NORMAL_LTO_MODE=${LTO_MODE}" >> "$GITHUB_ENV"
+          grep -E '^CONFIG_(LTO|LTO_CLANG|LTO_CLANG_FULL|LTO_CLANG_THIN|LTO_NONE|CFI_CLANG)=' "$CONFIG" || true
+
           echo "  --- SUSFS sub-options ---"
           grep -oE '^config KSU_SUSFS_[A-Z_]+' "$KSU_KCONFIG" | while read -r line; do
             OPT="CONFIG_${line#config }"
@@ -1054,13 +1039,12 @@ jobs:
             exit 1
           fi
 
-          if [ "${{ inputs.enable_thin_lto }}" = "true" ]; then
-            {
-              echo ""
-              echo "-- LINK-TIME OPTIMIZATION ------------------------"
-              echo "  Clang ThinLTO: enabled and verified after olddefconfig"
-            } >> "$CHANGELOG_PATH"
-          fi
+          {
+            echo ""
+            echo "-- LINK-TIME OPTIMIZATION ------------------------"
+            echo "  Original kernel LTO retained: ${NORMAL_LTO_MODE:-unknown}"
+            echo "  No ThinLTO override was applied by this workflow."
+          } >> "$CHANGELOG_PATH"
           # Include changelog in the flashable ZIP
           if [ -f "$CHANGELOG_PATH" ]; then
             cp "$CHANGELOG_PATH" AnyKernel3/
@@ -1086,13 +1070,13 @@ jobs:
           echo "========================================================"
           echo "  VERDICT: ${FLASH_PRIORITY}"
           echo ""
-          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-yucca-zeromount-thinlto-test-v2-${{ steps.meta.outputs.date }}"
+          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-yucca-zeromount-normal-lto-test-${{ steps.meta.outputs.date }}"
           echo "========================================================"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-yucca-zeromount-thinlto-test-v2-${{ steps.meta.outputs.date }}
+          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-yucca-zeromount-normal-lto-test-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
           if-no-files-found: warn
@@ -1134,7 +1118,7 @@ jobs:
           fi
 
           VARIANT="${{ matrix.display_name }}"
-          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-yucca-zeromount-thinlto-test-v2-${{ steps.meta.outputs.date }}"
+          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-yucca-zeromount-normal-lto-test-${{ steps.meta.outputs.date }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Build the JSON payload
