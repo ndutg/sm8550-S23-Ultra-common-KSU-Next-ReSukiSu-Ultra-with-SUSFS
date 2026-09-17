@@ -1,4 +1,4 @@
-name: Test ZeroMount WITHOUT procfs hooks for audio
+name: Test ZeroMount Core Without Procfs or Metadata Hooks
 
 on:
   workflow_dispatch:
@@ -595,12 +595,15 @@ jobs:
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
           rm -f "$PATCH_LOG"
 
-          # ── AUDIO ISOLATION TEST: exclude ZeroMount procfs hooks ──
-          # Preserve the post-SUSFS versions, then restore them after the
-          # main ZeroMount patch. This removes only ZeroMount changes from
-          # fs/proc/task_mmu.c and fs/proc/base.c.
+          # ── AUDIO ISOLATION TEST: core ZeroMount only ──
+          # Preserve the post-SUSFS versions of procfs and metadata files,
+          # then restore them after the main ZeroMount patch. This leaves
+          # the core path-redirection and directory-injection hooks active.
           cp fs/proc/task_mmu.c /tmp/task_mmu.pre-zeromount.c
           cp fs/proc/base.c /tmp/proc_base.pre-zeromount.c
+          cp fs/stat.c /tmp/stat.pre-zeromount.c
+          cp fs/statfs.c /tmp/statfs.pre-zeromount.c
+          cp fs/xattr.c /tmp/xattr.pre-zeromount.c
 
           # Match Yucca's logic exactly:
           # 1. Detect an already-applied patch with a reverse dry run at F3.
@@ -624,56 +627,27 @@ jobs:
             fi
           fi
 
-          echo "==> AUDIO ISOLATION TEST: reverting ZeroMount procfs changes..."
+          echo "==> AUDIO ISOLATION TEST: reverting ZeroMount procfs and metadata changes..."
           cp /tmp/task_mmu.pre-zeromount.c fs/proc/task_mmu.c
           cp /tmp/proc_base.pre-zeromount.c fs/proc/base.c
+          cp /tmp/stat.pre-zeromount.c fs/stat.c
+          cp /tmp/statfs.pre-zeromount.c fs/statfs.c
+          cp /tmp/xattr.pre-zeromount.c fs/xattr.c
 
-          for PROC_FILE in fs/proc/task_mmu.c fs/proc/base.c; do
-            if grep -qiE 'zeromount' "$PROC_FILE"; then
-              echo "::error::ZeroMount references remain in $PROC_FILE after revert."
-              grep -niE 'zeromount' "$PROC_FILE"
+          for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c; do
+            if grep -qiE 'zeromount' "$ISOLATED_FILE"; then
+              echo "::error::ZeroMount references remain in $ISOLATED_FILE after revert."
+              grep -niE 'zeromount' "$ISOLATED_FILE"
               exit 1
             fi
           done
+
           echo "==> fs/proc/task_mmu.c restored to SUSFS-only state."
           echo "==> fs/proc/base.c restored to SUSFS-only state."
-
-          # Exact Yucca C89 compatibility patch. It moves fname to the
-          # declaration section before the ZeroMount executable statements.
-          cat > "$C89_PATCH" <<'PATCH'
-          diff --git a/fs/stat.c b/fs/stat.c
-          index c9af377..17fd32c 100644
-          --- a/fs/stat.c
-          +++ b/fs/stat.c
-          @@ -285,6 +285,7 @@ static int vfs_statx(int dfd, const char __user *filename, int flags,
-           	unsigned lookup_flags = 0;
-           	int error;
-           #ifdef CONFIG_KSU_SUSFS
-          +	struct filename *fname = NULL;
-           #ifdef CONFIG_ZEROMOUNT
-           	/* Try ZeroMount hook for relative paths */
-           	if (filename) {
-          @@ -293,9 +294,6 @@ static int vfs_statx(int dfd, const char __user *filename, int flags,
-           			return zm_ret;
-           	}
-           #endif
-          -
-          -
-          -	struct filename *fname = NULL;
-           #endif
-
-           	if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH |
-          PATCH
-          sed -i 's/^          //' "$C89_PATCH"
-
-          echo "==> Applying Yucca zeromount-stat-c89 compatibility patch..."
-          if /usr/bin/patch -p1 -R --forward --dry-run --batch --fuzz=0 \
-               < "$C89_PATCH" >/dev/null 2>&1; then
-            echo "==> C89 compatibility patch is already applied."
-          else
-            /usr/bin/patch -p1 --forward --batch --fuzz=0 \
-              --no-backup-if-mismatch < "$C89_PATCH"
-          fi
+          echo "==> fs/stat.c restored to its pre-ZeroMount state."
+          echo "==> fs/statfs.c restored to its pre-ZeroMount state."
+          echo "==> fs/xattr.c restored to its pre-ZeroMount state."
+          echo "==> Yucca fs/stat.c C89 fix is intentionally unnecessary because fs/stat.c was restored."
 
           # Reject unresolved patch output after both Yucca fixups.
           REJECTS="$(find . -type f -name '*.rej' -print)"
@@ -689,43 +663,19 @@ jobs:
             exit 1
           }
 
-          TASK_MMU_HOOKS="$(grep -ciE 'zeromount' fs/proc/task_mmu.c || true)"
-          PROC_BASE_HOOKS="$(grep -ciE 'zeromount' fs/proc/base.c || true)"
-          [ "$TASK_MMU_HOOKS" = "0" ] || {
-            echo "::error::task_mmu ZeroMount hooks should be absent, found $TASK_MMU_HOOKS."
+          ISOLATED_HOOKS=0
+          for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c; do
+            COUNT="$(grep -ciE 'zeromount' "$ISOLATED_FILE" || true)"
+            echo "==> $ISOLATED_FILE ZeroMount references: $COUNT"
+            if [ "$COUNT" != "0" ]; then
+              ISOLATED_HOOKS=1
+            fi
+          done
+          [ "$ISOLATED_HOOKS" = "0" ] || {
+            echo "::error::One or more isolated procfs/metadata hooks remain."
             exit 1
           }
-          [ "$PROC_BASE_HOOKS" = "0" ] || {
-            echo "::error::proc/base ZeroMount hooks should be absent, found $PROC_BASE_HOOKS."
-            exit 1
-          }
-          echo "==> Confirmed: ZeroMount procfs hooks are excluded."
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path('fs/stat.c')
-          lines = p.read_text().splitlines()
-          decl = [i for i, line in enumerate(lines)
-                  if 'struct filename *fname = NULL;' in line]
-          hook = [i for i, line in enumerate(lines)
-                  if 'Try ZeroMount hook for relative paths' in line]
-
-          if len(decl) != 1:
-              raise SystemExit(
-                  f'Expected one fname declaration in fs/stat.c, found {len(decl)}'
-              )
-          if len(hook) != 1:
-              raise SystemExit(
-                  f'Expected one relative-path ZeroMount block in fs/stat.c, found {len(hook)}'
-              )
-          if decl[0] > hook[0]:
-              raise SystemExit(
-                  'fname declaration remains after ZeroMount executable code'
-              )
-
-          print('fs/stat.c C89 declaration placement verified.')
-          PY
+          echo "==> Confirmed: ZeroMount procfs and metadata hooks are excluded."
 
           MAX_FUZZ=0
           if [ -s "$PATCH_LOG" ]; then
@@ -738,8 +688,8 @@ jobs:
 
           echo "ZEROMOUNT_ENABLED=1" >> "$GITHUB_ENV"
           echo "ZEROMOUNT_MAX_FUZZ=${MAX_FUZZ}" >> "$GITHUB_ENV"
-          echo "==> ZeroMount integration passed with procfs hooks intentionally EXCLUDED."
-          echo "==> Main patch maximum fuzz: ${MAX_FUZZ}; explicit fixups verified."
+          echo "==> ZeroMount core-only integration passed; procfs and metadata hooks are EXCLUDED."
+          echo "==> Main patch maximum fuzz: ${MAX_FUZZ}; isolated files restored and verified."
 
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
           rm -rf super-builders
@@ -763,8 +713,12 @@ jobs:
           grep -q 'CONFIG_ZEROMOUNT' fs/Makefile
           grep -q 'zeromount_getname_hook' fs/namei.c
           grep -q 'zeromount_inject_dents' fs/readdir.c
-          [ "$(grep -ciE 'zeromount' fs/proc/task_mmu.c || true)" = "0" ]
-          [ "$(grep -ciE 'zeromount' fs/proc/base.c || true)" = "0" ]
+          for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c; do
+            [ "$(grep -ciE 'zeromount' "$ISOLATED_FILE" || true)" = "0" ] || {
+              echo "::error::Unexpected ZeroMount reference remains in $ISOLATED_FILE"
+              exit 1
+            }
+          done
 
           echo "==> Baseline pin and ZeroMount integration checks passed."
           echo "==> Existing ReSukiSU and SUSFS source changes are intentionally retained from the known-good workflow."
@@ -1045,13 +999,13 @@ jobs:
           echo "========================================================"
           echo "  VERDICT: ${FLASH_PRIORITY}"
           echo ""
-          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-no-procfs-${{ steps.meta.outputs.date }}"
+          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-core-only-${{ steps.meta.outputs.date }}"
           echo "========================================================"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-no-procfs-${{ steps.meta.outputs.date }}
+          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-core-only-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
           if-no-files-found: warn
@@ -1093,7 +1047,7 @@ jobs:
           fi
 
           VARIANT="${{ matrix.display_name }}"
-          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-no-procfs-${{ steps.meta.outputs.date }}"
+          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-core-only-${{ steps.meta.outputs.date }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Build the JSON payload
