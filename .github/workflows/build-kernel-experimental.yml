@@ -1,4 +1,4 @@
-name: Test ZeroMount Readdir Fix v2 for Audio and Persistence
+name: Final Test ZeroMount Native getdents64 Readdir Only
 
 on:
   workflow_dispatch:
@@ -701,6 +701,131 @@ jobs:
             exit 1
           }
 
+          echo "==> FINAL READDIR ISOLATION: retaining only the getdents64 injection path..."
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('fs/readdir.c')
+          lines = path.read_text().splitlines(keepends=True)
+          call_indexes = [i for i, line in enumerate(lines)
+                          if 'zeromount_inject_dents' in line]
+
+          if len(call_indexes) != 3:
+              raise SystemExit(
+                  f'Expected three ZeroMount readdir injection calls, found {len(call_indexes)}'
+              )
+
+          def enclosing_entry(index):
+              # Linux readdir syscall entry points are declared with syscall
+              # macros. Search backwards and retain the native getdents64 path.
+              for pos in range(index, -1, -1):
+                  line = lines[pos]
+                  if re.search(r'(?:COMPAT_)?SYSCALL_DEFINE\d*\s*\(', line):
+                      block = ''.join(lines[pos:min(len(lines), pos + 4)])
+                      return pos, re.sub(r'\s+', ' ', block).strip()
+              return -1, '<unknown>'
+
+          entries = [(idx, *enclosing_entry(idx)) for idx in call_indexes]
+          for idx, start, name in entries:
+              print(f'Injection line {idx + 1}: {name}')
+
+          native64 = [item for item in entries
+                      if 'getdents64' in item[2]
+                      and 'COMPAT_SYSCALL_DEFINE' not in item[2]]
+          if len(native64) != 1:
+              raise SystemExit(
+                  f'Expected exactly one native getdents64 injection path, found {len(native64)}'
+              )
+
+          keep_index = native64[0][0]
+          remove_ranges = []
+
+          for call_index, _, name in entries:
+              if call_index == keep_index:
+                  print(f'KEEP: {name}')
+                  continue
+
+              # Remove the complete CONFIG_ZEROMOUNT block containing this
+              # injection call, including any local labels/control flow.
+              block_start = None
+              depth = 0
+              for pos in range(call_index, -1, -1):
+                  stripped = lines[pos].strip()
+                  if stripped == '#endif':
+                      depth += 1
+                  elif stripped.startswith('#if'):
+                      if depth:
+                          depth -= 1
+                      elif stripped == '#ifdef CONFIG_ZEROMOUNT':
+                          block_start = pos
+                          break
+
+              if block_start is None:
+                  raise SystemExit(
+                      f'Could not locate CONFIG_ZEROMOUNT block before line {call_index + 1}'
+                  )
+
+              depth = 0
+              block_end = None
+              for pos in range(block_start, len(lines)):
+                  stripped = lines[pos].strip()
+                  if stripped.startswith('#if'):
+                      depth += 1
+                  elif stripped == '#endif':
+                      depth -= 1
+                      if depth == 0:
+                          block_end = pos + 1
+                          break
+
+              if block_end is None or not (block_start <= call_index < block_end):
+                  raise SystemExit(
+                      f'Invalid ZeroMount block around injection line {call_index + 1}'
+                  )
+
+              print(f'REMOVE: {name} (lines {block_start + 1}-{block_end})')
+              remove_ranges.append((block_start, block_end))
+
+          for start, end in sorted(remove_ranges, reverse=True):
+              replacement = [
+                  '#ifdef CONFIG_ZEROMOUNT\n',
+                  '/* Audio isolation: this non-native64 directory injection path is disabled. */\n',
+                  '#endif\n',
+              ]
+              lines[start:end] = replacement
+
+          path.write_text(''.join(lines))
+
+          final = path.read_text()
+          calls = final.count('zeromount_inject_dents')
+          if calls != 1:
+              raise SystemExit(
+                  f'Expected one remaining ZeroMount readdir injection call, found {calls}'
+              )
+
+          # Re-identify the remaining call and confirm it belongs to native getdents64.
+          final_lines = final.splitlines()
+          remaining = next(i for i, line in enumerate(final_lines)
+                           if 'zeromount_inject_dents' in line)
+          context = '\n'.join(final_lines[max(0, remaining - 80):remaining + 2])
+          syscall_lines = [line for line in context.splitlines()
+                           if re.search(r'(?:COMPAT_)?SYSCALL_DEFINE\d*\s*\(', line)]
+          if not syscall_lines or 'getdents64' not in syscall_lines[-1]:
+              raise SystemExit('Remaining injection does not belong to getdents64')
+          if 'COMPAT_SYSCALL_DEFINE' in syscall_lines[-1]:
+              raise SystemExit('Remaining injection belongs to compat getdents64, not native64')
+
+          print('Verified: exactly one native getdents64 ZeroMount injection path remains.')
+          PY
+
+          FINAL_INJECT_CALLS="$(grep -c 'zeromount_inject_dents' fs/readdir.c || true)"
+          [ "$FINAL_INJECT_CALLS" = "1" ] || {
+            echo "::error::Expected exactly one final readdir injection call, found $FINAL_INJECT_CALLS."
+            exit 1
+          }
+          echo "ZEROMOUNT_READDIR_MODE=native-getdents64-only" >> "$GITHUB_ENV"
+          echo "==> Native arm64 getdents64-only readdir isolation verified."
+
           if find . -type f -name '*.rej' -print -quit | grep -q .; then
             echo "::error::A reject file was created by the readdir correction."
             find . -type f -name '*.rej' -print
@@ -758,7 +883,7 @@ jobs:
 
           echo "ZEROMOUNT_ENABLED=1" >> "$GITHUB_ENV"
           echo "ZEROMOUNT_MAX_FUZZ=${MAX_FUZZ}" >> "$GITHUB_ENV"
-          echo "==> ZeroMount integration passed with corrected readdir and procfs/metadata hooks excluded."
+          echo "==> ZeroMount integration passed with native getdents64-only readdir injection."
           echo "==> Main patch maximum fuzz: ${MAX_FUZZ}; isolated files restored and verified."
 
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
@@ -783,8 +908,12 @@ jobs:
           grep -q 'CONFIG_ZEROMOUNT' fs/Makefile
           grep -q 'zeromount_getname_hook' fs/namei.c
           grep -q 'zeromount_inject_dents' fs/readdir.c
-          [ "$(grep -c 'count != initial_count' fs/readdir.c || true)" -ge 3 ] || {
-            echo "::error::Dedicated ZeroMount readdir guards are missing."
+          [ "$(grep -c 'zeromount_inject_dents' fs/readdir.c || true)" = "1" ] || {
+            echo "::error::Expected only the native getdents64 ZeroMount injection path."
+            exit 1
+          }
+          [ "$(grep -c 'count != initial_count' fs/readdir.c || true)" -ge 1 ] || {
+            echo "::error::The retained getdents64 guard is missing."
             exit 1
           }
           for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c; do
@@ -1073,13 +1202,13 @@ jobs:
           echo "========================================================"
           echo "  VERDICT: ${FLASH_PRIORITY}"
           echo ""
-          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-fixed-readdir-v2-${{ steps.meta.outputs.date }}"
+          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-readdir64-only-${{ steps.meta.outputs.date }}"
           echo "========================================================"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-fixed-readdir-v2-${{ steps.meta.outputs.date }}
+          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-readdir64-only-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
           if-no-files-found: warn
@@ -1121,7 +1250,7 @@ jobs:
           fi
 
           VARIANT="${{ matrix.display_name }}"
-          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-fixed-readdir-v2-${{ steps.meta.outputs.date }}"
+          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-readdir64-only-${{ steps.meta.outputs.date }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Build the JSON payload
