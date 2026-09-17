@@ -1,4 +1,4 @@
-name: Test Pinned Working Kernel + Yucca ZeroMount Minimal Delta
+name: Test ZeroMount WITHOUT procfs hooks for audio
 
 on:
   workflow_dispatch:
@@ -594,10 +594,13 @@ jobs:
 
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
           rm -f "$PATCH_LOG"
-          # ── ISOLATION TEST: exclude the task_mmu ZeroMount hook ──
-          # Snapshot the post-SUSFS task_mmu.c so the ZeroMount additions in
-          # this one file can be reverted after the main patch is applied.
+
+          # ── AUDIO ISOLATION TEST: exclude ZeroMount procfs hooks ──
+          # Preserve the post-SUSFS versions, then restore them after the
+          # main ZeroMount patch. This removes only ZeroMount changes from
+          # fs/proc/task_mmu.c and fs/proc/base.c.
           cp fs/proc/task_mmu.c /tmp/task_mmu.pre-zeromount.c
+          cp fs/proc/base.c /tmp/proc_base.pre-zeromount.c
 
           # Match Yucca's logic exactly:
           # 1. Detect an already-applied patch with a reverse dry run at F3.
@@ -620,15 +623,20 @@ jobs:
               exit 1
             fi
           fi
-          echo "==> ISOLATION TEST: reverting all ZeroMount changes in fs/proc/task_mmu.c..."
-          cp /tmp/task_mmu.pre-zeromount.c fs/proc/task_mmu.c
 
-          if grep -qiE 'zeromount' fs/proc/task_mmu.c; then
-            echo "::error::ZeroMount references remain in fs/proc/task_mmu.c after revert."
-            grep -niE 'zeromount' fs/proc/task_mmu.c
-            exit 1
-          fi
-          echo "==> fs/proc/task_mmu.c restored to its SUSFS-only state."
+          echo "==> AUDIO ISOLATION TEST: reverting ZeroMount procfs changes..."
+          cp /tmp/task_mmu.pre-zeromount.c fs/proc/task_mmu.c
+          cp /tmp/proc_base.pre-zeromount.c fs/proc/base.c
+
+          for PROC_FILE in fs/proc/task_mmu.c fs/proc/base.c; do
+            if grep -qiE 'zeromount' "$PROC_FILE"; then
+              echo "::error::ZeroMount references remain in $PROC_FILE after revert."
+              grep -niE 'zeromount' "$PROC_FILE"
+              exit 1
+            fi
+          done
+          echo "==> fs/proc/task_mmu.c restored to SUSFS-only state."
+          echo "==> fs/proc/base.c restored to SUSFS-only state."
 
           # Exact Yucca C89 compatibility patch. It moves fname to the
           # declaration section before the ZeroMount executable statements.
@@ -681,12 +689,17 @@ jobs:
             exit 1
           }
 
-          HOOK_COUNT="$(grep -c 'zeromount_spoof_mmap_metadata' fs/proc/task_mmu.c || true)"
-          [ "$HOOK_COUNT" = "0" ] || {
-            echo "::error::task_mmu hook should be absent in this isolation build, found $HOOK_COUNT."
+          TASK_MMU_HOOKS="$(grep -ciE 'zeromount' fs/proc/task_mmu.c || true)"
+          PROC_BASE_HOOKS="$(grep -ciE 'zeromount' fs/proc/base.c || true)"
+          [ "$TASK_MMU_HOOKS" = "0" ] || {
+            echo "::error::task_mmu ZeroMount hooks should be absent, found $TASK_MMU_HOOKS."
             exit 1
           }
-          echo "==> Confirmed: no ZeroMount metadata hook in fs/proc/task_mmu.c."
+          [ "$PROC_BASE_HOOKS" = "0" ] || {
+            echo "::error::proc/base ZeroMount hooks should be absent, found $PROC_BASE_HOOKS."
+            exit 1
+          }
+          echo "==> Confirmed: ZeroMount procfs hooks are excluded."
 
           python3 - <<'PY'
           from pathlib import Path
@@ -725,7 +738,7 @@ jobs:
 
           echo "ZEROMOUNT_ENABLED=1" >> "$GITHUB_ENV"
           echo "ZEROMOUNT_MAX_FUZZ=${MAX_FUZZ}" >> "$GITHUB_ENV"
-          echo "==> Yucca-style ZeroMount integration passed."
+          echo "==> ZeroMount integration passed with procfs hooks intentionally EXCLUDED."
           echo "==> Main patch maximum fuzz: ${MAX_FUZZ}; explicit fixups verified."
 
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
@@ -750,7 +763,8 @@ jobs:
           grep -q 'CONFIG_ZEROMOUNT' fs/Makefile
           grep -q 'zeromount_getname_hook' fs/namei.c
           grep -q 'zeromount_inject_dents' fs/readdir.c
-          [ "$(grep -c 'zeromount_spoof_mmap_metadata' fs/proc/task_mmu.c || true)" = "0" ]
+          [ "$(grep -ciE 'zeromount' fs/proc/task_mmu.c || true)" = "0" ]
+          [ "$(grep -ciE 'zeromount' fs/proc/base.c || true)" = "0" ]
 
           echo "==> Baseline pin and ZeroMount integration checks passed."
           echo "==> Existing ReSukiSU and SUSFS source changes are intentionally retained from the known-good workflow."
@@ -1031,13 +1045,13 @@ jobs:
           echo "========================================================"
           echo "  VERDICT: ${FLASH_PRIORITY}"
           echo ""
-          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-no-taskmmu-${{ steps.meta.outputs.date }}"
+          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-no-procfs-${{ steps.meta.outputs.date }}"
           echo "========================================================"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-no-taskmmu-${{ steps.meta.outputs.date }}
+          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-no-procfs-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
           if-no-files-found: warn
@@ -1079,7 +1093,7 @@ jobs:
           fi
 
           VARIANT="${{ matrix.display_name }}"
-          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-no-taskmmu-${{ steps.meta.outputs.date }}"
+          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-no-procfs-${{ steps.meta.outputs.date }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Build the JSON payload
