@@ -1,4 +1,4 @@
-name: Test ZeroMount Core Without Procfs or Metadata Hooks
+name: Test ZeroMount Path Core Without Readdir Procfs Metadata
 
 on:
   workflow_dispatch:
@@ -588,8 +588,7 @@ jobs:
             [ -s include/linux/zeromount.h ] &&
             grep -q 'config ZEROMOUNT' fs/Kconfig &&
             grep -q 'CONFIG_ZEROMOUNT' fs/Makefile &&
-            grep -q 'zeromount_getname_hook' fs/namei.c &&
-            grep -q 'zeromount_inject_dents' fs/readdir.c
+            grep -q 'zeromount_getname_hook' fs/namei.c
           }
 
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
@@ -604,6 +603,7 @@ jobs:
           cp fs/stat.c /tmp/stat.pre-zeromount.c
           cp fs/statfs.c /tmp/statfs.pre-zeromount.c
           cp fs/xattr.c /tmp/xattr.pre-zeromount.c
+          cp fs/readdir.c /tmp/readdir.pre-zeromount.c
 
           # Match Yucca's logic exactly:
           # 1. Detect an already-applied patch with a reverse dry run at F3.
@@ -633,8 +633,10 @@ jobs:
           cp /tmp/stat.pre-zeromount.c fs/stat.c
           cp /tmp/statfs.pre-zeromount.c fs/statfs.c
           cp /tmp/xattr.pre-zeromount.c fs/xattr.c
+          cp /tmp/readdir.pre-zeromount.c fs/readdir.c
 
-          for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c; do
+          for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c \
+            fs/readdir.c; do
             if grep -qiE 'zeromount' "$ISOLATED_FILE"; then
               echo "::error::ZeroMount references remain in $ISOLATED_FILE after revert."
               grep -niE 'zeromount' "$ISOLATED_FILE"
@@ -647,6 +649,7 @@ jobs:
           echo "==> fs/stat.c restored to its pre-ZeroMount state."
           echo "==> fs/statfs.c restored to its pre-ZeroMount state."
           echo "==> fs/xattr.c restored to its pre-ZeroMount state."
+          echo "==> fs/readdir.c restored to its pre-ZeroMount state."
           echo "==> Yucca fs/stat.c C89 fix is intentionally unnecessary because fs/stat.c was restored."
 
           # Reject unresolved patch output after both Yucca fixups.
@@ -664,7 +667,8 @@ jobs:
           }
 
           ISOLATED_HOOKS=0
-          for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c; do
+          for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c \
+            fs/readdir.c; do
             COUNT="$(grep -ciE 'zeromount' "$ISOLATED_FILE" || true)"
             echo "==> $ISOLATED_FILE ZeroMount references: $COUNT"
             if [ "$COUNT" != "0" ]; then
@@ -675,7 +679,7 @@ jobs:
             echo "::error::One or more isolated procfs/metadata hooks remain."
             exit 1
           }
-          echo "==> Confirmed: ZeroMount procfs and metadata hooks are excluded."
+          echo "==> Confirmed: procfs, metadata, and readdir hooks are excluded."
 
           MAX_FUZZ=0
           if [ -s "$PATCH_LOG" ]; then
@@ -688,7 +692,7 @@ jobs:
 
           echo "ZEROMOUNT_ENABLED=1" >> "$GITHUB_ENV"
           echo "ZEROMOUNT_MAX_FUZZ=${MAX_FUZZ}" >> "$GITHUB_ENV"
-          echo "==> ZeroMount core-only integration passed; procfs and metadata hooks are EXCLUDED."
+          echo "==> ZeroMount path-core integration passed; procfs, metadata, and readdir hooks are EXCLUDED."
           echo "==> Main patch maximum fuzz: ${MAX_FUZZ}; isolated files restored and verified."
 
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
@@ -712,7 +716,6 @@ jobs:
           grep -q 'config ZEROMOUNT' fs/Kconfig
           grep -q 'CONFIG_ZEROMOUNT' fs/Makefile
           grep -q 'zeromount_getname_hook' fs/namei.c
-          grep -q 'zeromount_inject_dents' fs/readdir.c
           for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c; do
             [ "$(grep -ciE 'zeromount' "$ISOLATED_FILE" || true)" = "0" ] || {
               echo "::error::Unexpected ZeroMount reference remains in $ISOLATED_FILE"
@@ -999,13 +1002,13 @@ jobs:
           echo "========================================================"
           echo "  VERDICT: ${FLASH_PRIORITY}"
           echo ""
-          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-core-only-${{ steps.meta.outputs.date }}"
+          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-path-core-${{ steps.meta.outputs.date }}"
           echo "========================================================"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-core-only-${{ steps.meta.outputs.date }}
+          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-path-core-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
           if-no-files-found: warn
@@ -1047,7 +1050,7 @@ jobs:
           fi
 
           VARIANT="${{ matrix.display_name }}"
-          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-core-only-${{ steps.meta.outputs.date }}"
+          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-path-core-${{ steps.meta.outputs.date }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Build the JSON payload
