@@ -1,4 +1,4 @@
-name: Test ZeroMount Path Core Without Readdir Procfs Metadata
+name: Test ZeroMount Readdir Fix for Audio and Persistence
 
 on:
   workflow_dispatch:
@@ -588,7 +588,8 @@ jobs:
             [ -s include/linux/zeromount.h ] &&
             grep -q 'config ZEROMOUNT' fs/Kconfig &&
             grep -q 'CONFIG_ZEROMOUNT' fs/Makefile &&
-            grep -q 'zeromount_getname_hook' fs/namei.c
+            grep -q 'zeromount_getname_hook' fs/namei.c &&
+            grep -q 'zeromount_inject_dents' fs/readdir.c
           }
 
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
@@ -603,7 +604,6 @@ jobs:
           cp fs/stat.c /tmp/stat.pre-zeromount.c
           cp fs/statfs.c /tmp/statfs.pre-zeromount.c
           cp fs/xattr.c /tmp/xattr.pre-zeromount.c
-          cp fs/readdir.c /tmp/readdir.pre-zeromount.c
 
           # Match Yucca's logic exactly:
           # 1. Detect an already-applied patch with a reverse dry run at F3.
@@ -633,10 +633,8 @@ jobs:
           cp /tmp/stat.pre-zeromount.c fs/stat.c
           cp /tmp/statfs.pre-zeromount.c fs/statfs.c
           cp /tmp/xattr.pre-zeromount.c fs/xattr.c
-          cp /tmp/readdir.pre-zeromount.c fs/readdir.c
 
-          for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c \
-            fs/readdir.c; do
+          for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c; do
             if grep -qiE 'zeromount' "$ISOLATED_FILE"; then
               echo "::error::ZeroMount references remain in $ISOLATED_FILE after revert."
               grep -niE 'zeromount' "$ISOLATED_FILE"
@@ -649,8 +647,68 @@ jobs:
           echo "==> fs/stat.c restored to its pre-ZeroMount state."
           echo "==> fs/statfs.c restored to its pre-ZeroMount state."
           echo "==> fs/xattr.c restored to its pre-ZeroMount state."
-          echo "==> fs/readdir.c restored to its pre-ZeroMount state."
           echo "==> Yucca fs/stat.c C89 fix is intentionally unnecessary because fs/stat.c was restored."
+
+          echo "==> Applying dedicated ZeroMount readdir control-flow correction..."
+          FIX_REPO="https://github.com/cawilliamson/GKI_KernelSU_SUSFS_ZeroMount.git"
+          FIX_DIR="/tmp/zeromount-readdir-fix"
+          FIX_PATCH="$FIX_DIR/patches/fix-zeromount-readdir.patch"
+          FIX_LOG="/tmp/zeromount-readdir-fix.log"
+
+          rm -rf "$FIX_DIR"
+          git clone --quiet --depth 1 "$FIX_REPO" "$FIX_DIR"
+          test -s "$FIX_PATCH" || {
+            echo "::error::Dedicated readdir correction was not found: $FIX_PATCH"
+            exit 1
+          }
+
+          FIX_SHA="$(git -C "$FIX_DIR" rev-parse HEAD)"
+          echo "Readdir correction repository SHA: $FIX_SHA"
+          echo "Readdir correction patch: $FIX_PATCH"
+
+          # This compatibility patch must match exactly. Do not mask a bad
+          # context match with fuzz because readdir is the audio-regression site.
+          if /usr/bin/patch -p1 -R --dry-run --batch --fuzz=0 \
+               < "$FIX_PATCH" >/dev/null 2>&1; then
+            echo "==> Readdir correction is already applied."
+          else
+            if ! /usr/bin/patch -p1 --forward --dry-run --batch --fuzz=0 \
+                 < "$FIX_PATCH" > "$FIX_LOG" 2>&1; then
+              echo "::error::Readdir correction does not match this patched Samsung tree at fuzz 0."
+              cat "$FIX_LOG"
+              exit 1
+            fi
+
+            /usr/bin/patch -p1 --forward --batch --fuzz=0 \
+              --no-backup-if-mismatch < "$FIX_PATCH" 2>&1 | tee "$FIX_LOG"
+          fi
+
+          # Validate the intent of the public correction. It adds count guards
+          # around ZeroMount directory injection so existing directory entries
+          # are not incorrectly reprocessed.
+          COUNT_GUARDS="$(grep -c 'count != initial_count' fs/readdir.c || true)"
+          INJECT_CALLS="$(grep -c 'zeromount_inject_dents' fs/readdir.c || true)"
+          echo "readdir count guards: $COUNT_GUARDS"
+          echo "readdir ZeroMount injection calls: $INJECT_CALLS"
+
+          [ "$COUNT_GUARDS" -ge 3 ] || {
+            echo "::error::Expected at least three count != initial_count guards in fs/readdir.c."
+            exit 1
+          }
+          [ "$INJECT_CALLS" -ge 1 ] || {
+            echo "::error::ZeroMount directory injection is missing from fs/readdir.c."
+            exit 1
+          }
+
+          if find . -type f -name '*.rej' -print -quit | grep -q .; then
+            echo "::error::A reject file was created by the readdir correction."
+            find . -type f -name '*.rej' -print
+            exit 1
+          fi
+
+          echo "ZEROMOUNT_READDIR_FIX_SHA=$FIX_SHA" >> "$GITHUB_ENV"
+          echo "==> ZeroMount readdir correction applied and verified at fuzz 0."
+          rm -rf "$FIX_DIR"
 
           # Reject unresolved patch output after both Yucca fixups.
           REJECTS="$(find . -type f -name '*.rej' -print)"
@@ -667,8 +725,7 @@ jobs:
           }
 
           ISOLATED_HOOKS=0
-          for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c \
-            fs/readdir.c; do
+          for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c; do
             COUNT="$(grep -ciE 'zeromount' "$ISOLATED_FILE" || true)"
             echo "==> $ISOLATED_FILE ZeroMount references: $COUNT"
             if [ "$COUNT" != "0" ]; then
@@ -679,7 +736,7 @@ jobs:
             echo "::error::One or more isolated procfs/metadata hooks remain."
             exit 1
           }
-          echo "==> Confirmed: procfs, metadata, and readdir hooks are excluded."
+          echo "==> Confirmed: ZeroMount procfs and metadata hooks are excluded."
 
           MAX_FUZZ=0
           if [ -s "$PATCH_LOG" ]; then
@@ -692,7 +749,7 @@ jobs:
 
           echo "ZEROMOUNT_ENABLED=1" >> "$GITHUB_ENV"
           echo "ZEROMOUNT_MAX_FUZZ=${MAX_FUZZ}" >> "$GITHUB_ENV"
-          echo "==> ZeroMount path-core integration passed; procfs, metadata, and readdir hooks are EXCLUDED."
+          echo "==> ZeroMount integration passed with corrected readdir and procfs/metadata hooks excluded."
           echo "==> Main patch maximum fuzz: ${MAX_FUZZ}; isolated files restored and verified."
 
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -delete
@@ -716,6 +773,11 @@ jobs:
           grep -q 'config ZEROMOUNT' fs/Kconfig
           grep -q 'CONFIG_ZEROMOUNT' fs/Makefile
           grep -q 'zeromount_getname_hook' fs/namei.c
+          grep -q 'zeromount_inject_dents' fs/readdir.c
+          [ "$(grep -c 'count != initial_count' fs/readdir.c || true)" -ge 3 ] || {
+            echo "::error::Dedicated ZeroMount readdir guards are missing."
+            exit 1
+          }
           for ISOLATED_FILE in             fs/proc/task_mmu.c             fs/proc/base.c             fs/stat.c             fs/statfs.c             fs/xattr.c; do
             [ "$(grep -ciE 'zeromount' "$ISOLATED_FILE" || true)" = "0" ] || {
               echo "::error::Unexpected ZeroMount reference remains in $ISOLATED_FILE"
@@ -1002,13 +1064,13 @@ jobs:
           echo "========================================================"
           echo "  VERDICT: ${FLASH_PRIORITY}"
           echo ""
-          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-path-core-${{ steps.meta.outputs.date }}"
+          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-fixed-readdir-${{ steps.meta.outputs.date }}"
           echo "========================================================"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-path-core-${{ steps.meta.outputs.date }}
+          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-zeromount-fixed-readdir-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
           if-no-files-found: warn
@@ -1050,7 +1112,7 @@ jobs:
           fi
 
           VARIANT="${{ matrix.display_name }}"
-          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-path-core-${{ steps.meta.outputs.date }}"
+          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-zeromount-fixed-readdir-${{ steps.meta.outputs.date }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Build the JSON payload
