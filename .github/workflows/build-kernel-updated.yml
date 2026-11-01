@@ -623,10 +623,16 @@ jobs:
             done
             ./scripts/config --file out/.config -d CONFIG_KSU_SUSFS
           fi
-          # Enable manual hook if this variant uses it
-          if [ "${{ matrix.use_manual_hook }}" = "true" ]; then
+          # Hook mode:
+          #  SUSFS on  -> SUSFS inline hooks (unchanged behaviour)
+          #  SUSFS off -> don't force manual hook; this source has no BakaSU
+          #               manual hooks (they came from the SUSFS patch)
+          if [ "$ENABLE_SUSFS" = "true" ] && [ "${{ matrix.use_manual_hook }}" = "true" ]; then
             echo "==> Enabling manual hook mode..."
             ./scripts/config --file out/.config -e CONFIG_KSU_MANUAL_HOOK
+          elif [ "$ENABLE_SUSFS" != "true" ]; then
+            echo "==> SUSFS off — using BakaSU default hook mode"
+            ./scripts/config --file out/.config -d CONFIG_KSU_MANUAL_HOOK
           fi
 
           make -j$(nproc --all) O=out ARCH=arm64 \
