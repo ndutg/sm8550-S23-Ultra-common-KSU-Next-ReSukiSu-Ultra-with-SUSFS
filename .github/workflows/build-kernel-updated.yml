@@ -474,9 +474,22 @@ jobs:
           cp susfs4ksu/kernel_patches/include/linux/susfs.h     include/linux/
           cp susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
 
-          patch -p1 --forward \
-            < "susfs4ksu/kernel_patches/50_add_susfs_in_${{ env.SUSFS_BRANCH }}.patch" \
-            || { echo "ERROR: SUSFS kernel patch failed."; exit 1; }
+          SUSFS_PATCH="susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch"
+
+          if patch -p1 --forward --dry-run < "$SUSFS_PATCH" >/dev/null 2>&1; then
+            patch -p1 --forward < "$SUSFS_PATCH"
+          else
+            echo "==> Strict apply failed; retrying with --fuzz=3 (Yucca method)..."
+            patch -p1 --forward --fuzz=3 < "$SUSFS_PATCH" || true
+          fi
+
+          REJECTS="$(find . -name '*.rej' -not -path './out/*')"
+          if [ -n "$REJECTS" ]; then
+            echo "ERROR: SUSFS hunks still rejected:"
+            for r in $REJECTS; do echo "--- $r ---"; cat "$r"; done
+            exit 1
+          fi
+          echo "==> SUSFS main patch applied with no rejects."
 
           KSU_PATCH="susfs4ksu/kernel_patches/10_enable_susfs_for_ksu.patch"
           if [ -f "$KSU_PATCH" ]; then
