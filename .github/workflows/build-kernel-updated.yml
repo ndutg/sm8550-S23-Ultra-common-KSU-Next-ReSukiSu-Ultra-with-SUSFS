@@ -634,7 +634,13 @@ jobs:
             echo "==> SUSFS off — using BakaSU default hook mode"
             ./scripts/config --file out/.config -d CONFIG_KSU_MANUAL_HOOK
           fi
-
+          # ThinLTO: far lower memory than Full LTO (BakaSU recommends it
+          # for builders with < 24 GB RAM; GitHub runners have 16 GB)
+          ./scripts/config --file out/.config -d CONFIG_LTO_NONE
+          ./scripts/config --file out/.config -e CONFIG_LTO
+          ./scripts/config --file out/.config -e CONFIG_LTO_CLANG
+          ./scripts/config --file out/.config -e CONFIG_LTO_CLANG_THIN
+          ./scripts/config --file out/.config -d CONFIG_LTO_CLANG_FULL
           make -j$(nproc --all) O=out ARCH=arm64 \
             CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
             olddefconfig
