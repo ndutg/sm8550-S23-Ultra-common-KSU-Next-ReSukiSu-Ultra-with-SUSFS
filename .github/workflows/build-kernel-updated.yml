@@ -483,6 +483,48 @@ jobs:
             patch -p1 --forward --fuzz=3 < "$SUSFS_PATCH" || true
           fi
 
+          # ── Targeted port of fs/namespace.c hunk #1 (header block only) ──
+          if [ -f fs/namespace.c.rej ]; then
+            echo "==> Porting rejected fs/namespace.c header hunk manually..."
+            python3 - <<'PY'
+          import sys
+          p = "fs/namespace.c"
+          s = open(p).read()
+
+          inc = ("#ifdef CONFIG_KSU_SUSFS\n"
+                 "#include <linux/susfs_def.h>\n"
+                 "#endif // #ifdef CONFIG_KSU_SUSFS\n\n")
+          blk = ("#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+                 "extern bool susfs_is_current_ksu_domain(void);\n"
+                 "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n\n"
+                 "#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */\n"
+                 "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\n")
+
+          inc_anchor = '#include "pnode.h"'
+          blk_anchor = "/* Maximum number of mounts in a mount namespace */"
+
+          if "linux/susfs_def.h" not in s:
+              if inc_anchor not in s:
+                  sys.exit("ERROR: anchor '#include \"pnode.h\"' not found in fs/namespace.c")
+              s = s.replace(inc_anchor, inc + inc_anchor, 1)
+
+          if "susfs_is_sdcard_android_data_not_decrypted;" not in s:
+              if blk_anchor not in s:
+                  sys.exit("ERROR: anchor 'Maximum number of mounts' not found in fs/namespace.c")
+              s = s.replace(blk_anchor, blk + blk_anchor, 1)
+
+          open(p, "w").write(s)
+          print("    fs/namespace.c header block inserted.")
+          PY
+            rm -f fs/namespace.c.rej fs/namespace.c.orig
+
+            grep -q 'linux/susfs_def.h' fs/namespace.c \
+              && grep -q 'CL_COPY_MNT_NS BIT(25)' fs/namespace.c \
+              || { echo "ERROR: fs/namespace.c manual port failed"; exit 1; }
+            echo "==> fs/namespace.c manual port verified."
+          fi
+
+          # ── Any OTHER rejects are still fatal ──
           REJECTS="$(find . -name '*.rej' -not -path './out/*')"
           if [ -n "$REJECTS" ]; then
             echo "ERROR: SUSFS hunks still rejected:"
