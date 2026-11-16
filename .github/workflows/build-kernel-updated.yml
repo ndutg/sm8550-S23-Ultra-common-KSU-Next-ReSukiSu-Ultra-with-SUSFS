@@ -1,8 +1,6 @@
 name: Build SM8550 Kernel — KSU-Next + ReSukiSU (SUSFS optional)
 
 on:
-  schedule:
-    - cron: '0 3 * * *'   # Daily — ReSukiSU only, without SUSFS
   workflow_dispatch:
     inputs:
       build_ksun:
