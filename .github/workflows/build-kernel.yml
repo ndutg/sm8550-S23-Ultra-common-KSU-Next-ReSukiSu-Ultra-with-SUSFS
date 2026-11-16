@@ -1,128 +1,347 @@
-name: Build SM8550 Kernel — KSU-Next + ReSukiSU
+name: Build SM8550 Kernel (BakaSU)
+
+# ══════════════════════════════════════════════════════════════════
+#  Two-stage pipeline
+#
+#  1. check  — cheap (~1 min). Fetches commit history only for the
+#              kernel, BakaSU and SUSFS, compares against the SHAs of
+#              the last successful build, categorises the new commits
+#              and calculates a flash priority.
+#
+#  2. build  — full compile. Only runs when:
+#                * priority is anything other than SKIP, or
+#                * there is no usable baseline (first run / cache lost), or
+#                * it is a manual run with force_build ticked.
+#              The build is PINNED to the exact SHAs the check job saw,
+#              so the changelog always matches what was compiled.
+#
+#  Scheduled runs always build WITH SUSFS.
+#  Manual runs let you choose SUSFS on/off.
+#
+#  When a run is skipped, the SHA baseline is NOT advanced, so minor
+#  changes accumulate until something worth building arrives.
+# ══════════════════════════════════════════════════════════════════
 
 on:
+  schedule:
+    - cron: '0 2 * * *'   # 02:00 UTC daily — adjust to match your old schedule
   workflow_dispatch:
     inputs:
-      build_ksun:
-        description: "Build KernelSU-Next (stable)"
+      enable_susfs:
+        description: "Build with SUSFS"
         type: boolean
         default: true
-      build_resukisu:
-        description: "Build ReSukiSU (main)"
-        type: boolean
-        default: true
-      enable_kpm:
-        description: "Enable KPM — Kernel Patch Manager (ReSukiSU only)"
+      force_build:
+        description: "Build even if the priority is SKIP"
         type: boolean
         default: true
 
 permissions:
-  contents: write
+  contents: read
   actions: write
-  packages: write
+
+concurrency:
+  group: sm8550-kernel-build
+  cancel-in-progress: false
 
 env:
   KERNEL_BRANCH: android13-5.15
+  KSU_REPO: https://github.com/ReSukiSU/ReSukiSU.git
+  KSU_SETUP_URL: https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
   SUSFS_BRANCH: gki-android13-5.15
   CLANG_VERSION: r584948
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  # Scheduled runs always use SUSFS; manual runs follow the tickbox.
+  ENABLE_SUSFS: ${{ github.event_name == 'schedule' || inputs.enable_susfs }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
 
-  setup:
-    name: Resolve build matrix
+  # ════════════════════════════════════════════════════════════════
+  #  STAGE 1 — Check for changes and decide
+  # ════════════════════════════════════════════════════════════════
+  check:
+    name: Check upstream changes
     runs-on: ubuntu-24.04
     outputs:
-      matrix: ${{ steps.build-matrix.outputs.matrix }}
-      is_empty: ${{ steps.build-matrix.outputs.is_empty }}
-    steps:
-      - name: Build variant matrix from inputs
-        id: build-matrix
-        run: |
-          VARIANTS='[]'
-          if [ "${{ inputs.build_ksun }}" = "true" ]; then
-            VARIANTS=$(echo "$VARIANTS" | jq -c '. += [{
-              "variant": "ksun-stable",
-              "display_name": "KernelSU-Next (stable)",
-              "setup_url": "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh",
-              "setup_arg": "main",
-              "ksu_dir": "KernelSU-Next",
-              "artifact_prefix": "ksun-stable",
-              "enable_kpm": "false",
-              "use_manual_hook": "false"
-            }]')
-          fi
-          if [ "${{ inputs.build_resukisu }}" = "true" ]; then
-            VARIANTS=$(echo "$VARIANTS" | jq -c '. += [{
-              "variant": "resukisu",
-              "display_name": "ReSukiSU (main)",
-              "setup_url": "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh",
-              "setup_arg": "main",
-              "ksu_dir": "KernelSU",
-              "artifact_prefix": "resukisu",
-              "enable_kpm": "${{ inputs.enable_kpm }}",
-              "use_manual_hook": "true"
-            }]')
-          fi
-          COUNT=$(echo "$VARIANTS" | jq 'length')
-          echo "Selected $COUNT variant(s)."
-          if [ "$COUNT" -eq 0 ]; then
-            echo "is_empty=true" >> $GITHUB_OUTPUT
-            echo 'matrix={"include":[]}' >> $GITHUB_OUTPUT
-            echo "::warning::No variants selected."
-          else
-            echo "is_empty=false" >> $GITHUB_OUTPUT
-            MATRIX=$(printf '{"include":%s}' "$VARIANTS" | jq -c .)
-            echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          fi
-
-  prepare-clang:
-    name: Cache Clang toolchain
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Restore Clang from cache
-        id: cache-clang
-        uses: actions/cache@v4
-        with:
-          path: clang-toolchain
-          key: clang-aosp-${{ env.CLANG_VERSION }}
-
-      - name: Download Clang (cache miss only)
-        if: steps.cache-clang.outputs.cache-hit != 'true'
-        run: |
-          echo "Cache miss — downloading AOSP Clang ${{ env.CLANG_VERSION }}..."
-          curl -sSfL --retry 3 --connect-timeout 30 \
-            -o clang.tar.gz \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/mirror-goog-main-llvm-toolchain-source/clang-${{ env.CLANG_VERSION }}.tar.gz" \
-            || { echo "ERROR: Clang download failed."; exit 1; }
-          mkdir -p clang-toolchain
-          tar -xf clang.tar.gz -C clang-toolchain
-          rm -f clang.tar.gz
-
-      - name: Verify Clang
-        run: |
-          export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
-          clang --version || { echo "ERROR: clang binary not found."; exit 1; }
-
-  build:
-    name: ${{ matrix.display_name }}
-    needs: [setup, prepare-clang]
-    if: needs.setup.outputs.is_empty == 'false'
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+      priority:     ${{ steps.decide.outputs.priority }}
+      kernel_sha:   ${{ steps.decide.outputs.kernel_sha }}
+      ksu_sha:      ${{ steps.decide.outputs.ksu_sha }}
+      susfs_sha:    ${{ steps.decide.outputs.susfs_sha }}
+      total_sec:    ${{ steps.decide.outputs.total_sec }}
+      total_fix:    ${{ steps.decide.outputs.total_fix }}
+      total_feat:   ${{ steps.decide.outputs.total_feat }}
+      total_lts:    ${{ steps.decide.outputs.total_lts }}
 
     steps:
-
-      - name: Checkout kernel source
+      # History only — no kernel source blobs are downloaded.
+      - name: Checkout kernel history (lightweight)
         uses: actions/checkout@v4
         with:
-          repository: ndutg/kernel_samsung_sm8550-common-ksususfs
           ref: ${{ env.KERNEL_BRANCH }}
+          fetch-depth: 300
+          filter: blob:none
+          sparse-checkout: .github
+
+      - name: Restore previous build SHAs
+        uses: actions/cache/restore@v4
+        with:
+          path: .prev_build_shas
+          key: build-shas-resukisu-
+          restore-keys: build-shas-resukisu-
+
+      - name: Fetch BakaSU and SUSFS history
+        run: |
+          git clone --quiet --filter=blob:none --no-checkout --branch main \
+            "$KSU_REPO" ksu-src \
+            || { echo "::error::BakaSU clone failed"; exit 1; }
+
+          git clone --quiet --filter=blob:none --no-checkout -b "$SUSFS_BRANCH" \
+            "$SUSFS_REPO" susfs-src \
+            || git clone --quiet --no-checkout -b "$SUSFS_BRANCH" "$SUSFS_REPO" susfs-src \
+            || { echo "::error::SUSFS clone failed"; exit 1; }
+
+      - name: Categorise changes and decide
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+        run: |
+          set -uo pipefail
+
+          prev() {
+            [ -f .prev_build_shas ] || return 0
+            grep "^$1=" .prev_build_shas | head -1 | cut -d= -f2- | tr -d "'" || true
+          }
+          PREV_KERNEL_SHA="$(prev PREV_KERNEL_SHA)"
+          PREV_KSU_SHA="$(prev PREV_KSU_SHA)"
+          PREV_SUSFS_SHA="$(prev PREV_SUSFS_SHA)"
+          PREV_DATE="$(prev PREV_DATE)"
+
+          KERNEL_SHA="$(git rev-parse HEAD)"
+          KSU_SHA="$(git -C ksu-src rev-parse HEAD)"
+          SUSFS_SHA="$(git -C susfs-src rev-parse HEAD)"
+
+          echo "==> Current : kernel ${KERNEL_SHA:0:12}  BakaSU ${KSU_SHA:0:12}  SUSFS ${SUSFS_SHA:0:12}"
+          echo "==> Previous: kernel ${PREV_KERNEL_SHA:0:12}  BakaSU ${PREV_KSU_SHA:0:12}  SUSFS ${PREV_SUSFS_SHA:0:12}  (${PREV_DATE:-none})"
+
+          BASELINE_OK=1
+
+          # get_log <dir> <prev_sha> <outfile> [pathspec...]
+          # Writes date|hash|subject lines. Returns 1 if the baseline
+          # commit could not be found (falls back to last 15 commits).
+          get_log() {
+            local dir="$1" prv="$2" out="$3"; shift 3
+            if [ -n "$prv" ] && git -C "$dir" cat-file -e "${prv}^{commit}" 2>/dev/null; then
+              git -C "$dir" log --date=short --format='%ad|%h|%s' "${prv}..HEAD" -- "$@" > "$out"
+              return 0
+            fi
+            git -C "$dir" log --date=short --format='%ad|%h|%s' -15 -- "$@" > "$out"
+            return 1
+          }
+
+          # Kernel: ignore commits that only touch .github (workflow edits)
+          get_log . "$PREV_KERNEL_SHA" /tmp/kernel.log . ':(exclude).github' || BASELINE_OK=0
+          get_log ksu-src "$PREV_KSU_SHA" /tmp/ksu.log || BASELINE_OK=0
+          SUSFS_BASE=1
+          get_log susfs-src "$PREV_SUSFS_SHA" /tmp/susfs.log || SUSFS_BASE=0
+          if [ "$ENABLE_SUSFS" = "true" ] && [ "$SUSFS_BASE" = 0 ]; then BASELINE_OK=0; fi
+
+          # categorise <label> <logfile>  -> prints section, writes <logfile>.counts
+          categorise() {
+            local label="$1" file="$2"
+            local sec=0 fix=0 feat=0 lts=0 other=0
+            local sec_l="" fix_l="" feat_l="" lts_l="" oth_l="" d h m l
+            while IFS='|' read -r d h m; do
+              [ -n "${m:-}" ] || continue
+              l="$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]')"
+              if echo "$l" | grep -qE 'security|cve-|vuln|overflow|use-after-free|oob|uaf|exploit|selinux fix'; then
+                sec=$((sec+1)); sec_l+="    🔒 ${d}  ${h}  ${m}"$'\n'
+              elif echo "$l" | grep -qE 'merge.*lts|merge.*5\.15\.|linux 5\.15\.|lts merge|upstream merge'; then
+                lts=$((lts+1)); lts_l+="    🔄 ${d}  ${h}  ${m}"$'\n'
+              elif echo "$l" | grep -qE 'fix|bug|crash|panic|null ptr|deadlock|race|hang|oops|regression|revert|resolve|repair'; then
+                fix=$((fix+1)); fix_l+="    🐛 ${d}  ${h}  ${m}"$'\n'
+              elif echo "$l" | grep -qE 'feat|add|support|implement|introduce|enable|new|enhance|improv|optim'; then
+                feat=$((feat+1)); feat_l+="    ✨ ${d}  ${h}  ${m}"$'\n'
+              else
+                other=$((other+1)); oth_l+="    🔧 ${d}  ${h}  ${m}"$'\n'
+              fi
+            done < "$file"
+            echo "  ${label}: ${sec} security, ${fix} bug fixes, ${feat} features, ${lts} LTS merges, ${other} other"
+            [ -n "$sec_l" ]  && printf '  -- Security --\n%s' "$sec_l"
+            [ -n "$fix_l" ]  && printf '  -- Bug Fixes --\n%s' "$fix_l"
+            [ -n "$feat_l" ] && printf '  -- Features --\n%s' "$feat_l"
+            [ -n "$lts_l" ]  && printf '  -- LTS / Upstream Merges --\n%s' "$lts_l"
+            [ -n "$oth_l" ]  && printf '  -- Other --\n%s' "$oth_l"
+            echo "$sec $fix $feat $lts $other" > "${file}.counts"
+          }
+
+          K_SECTION="$(categorise "Kernel" /tmp/kernel.log)"
+          B_SECTION="$(categorise "BakaSU" /tmp/ksu.log)"
+          S_SECTION="$(categorise "SUSFS" /tmp/susfs.log)"
+
+          read -r K_SEC K_FIX K_FEAT K_LTS K_OTH < /tmp/kernel.log.counts
+          read -r B_SEC B_FIX B_FEAT B_LTS B_OTH < /tmp/ksu.log.counts
+          read -r S_SEC S_FIX S_FEAT S_LTS S_OTH < /tmp/susfs.log.counts
+
+          # SUSFS changes only matter when SUSFS is part of this build
+          if [ "$ENABLE_SUSFS" != "true" ]; then S_SEC=0; S_FIX=0; S_FEAT=0; S_LTS=0; fi
+
+          TOTAL_SEC=$((K_SEC + B_SEC + S_SEC))
+          TOTAL_FIX=$((K_FIX + B_FIX + S_FIX))
+          TOTAL_FEAT=$((K_FEAT + B_FEAT + S_FEAT))
+          TOTAL_LTS=$((K_LTS + B_LTS + S_LTS))
+
+          if [ "$TOTAL_SEC" -gt 0 ]; then
+            LEVEL="FLASH NOW";   PRIORITY="🔴 FLASH NOW — Security patches detected"
+          elif [ "$TOTAL_FIX" -gt 2 ] || [ "$TOTAL_LTS" -gt 0 ]; then
+            LEVEL="RECOMMENDED"; PRIORITY="🟡 RECOMMENDED — Bug fixes or LTS merge"
+          elif [ "$TOTAL_FEAT" -gt 0 ] || [ "$TOTAL_FIX" -gt 0 ]; then
+            LEVEL="OPTIONAL";    PRIORITY="🟢 OPTIONAL — Minor improvements"
+          else
+            LEVEL="SKIP";        PRIORITY="⚪ SKIP — Maintenance only, no user-facing changes"
+          fi
+
+          # ── Decision ──
+          SHOULD_BUILD=false
+          if [ "$BASELINE_OK" != 1 ]; then
+            SHOULD_BUILD=true; REASON="No usable baseline from a previous build — building to establish one"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${FORCE_BUILD:-false}" = "true" ]; then
+            SHOULD_BUILD=true; REASON="Manual run with force_build"
+          elif [ "$LEVEL" != "SKIP" ]; then
+            SHOULD_BUILD=true; REASON="Priority is ${LEVEL}"
+          else
+            REASON="Priority is SKIP — no significant upstream changes since ${PREV_DATE:-last build}"
+          fi
+
+          echo ""
+          echo "==> Priority : ${PRIORITY}"
+          echo "==> Decision : build=${SHOULD_BUILD} (${REASON})"
+
+          # ── CHANGELOG.txt (shipped in the AnyKernel3 zip) ──
+          SINCE="since last build (${PREV_DATE:-n/a})"
+          [ "$BASELINE_OK" = 1 ] || SINCE="last 15 commits (no baseline)"
+          if [ "$ENABLE_SUSFS" = "true" ]; then SUSFS_LINE="${SUSFS_BRANCH} @ ${SUSFS_SHA:0:8}"; else SUSFS_LINE="disabled for this build"; fi
+          {
+            echo "======================================================="
+            echo "  SM8550 KERNEL BUILD — CHANGE SUMMARY"
+            echo "======================================================="
+            echo ""
+            echo "  Build Date:     $(date '+%Y-%m-%d %H:%M UTC')"
+            echo "  Root:           BakaSU (main)"
+            echo "  Kernel:         ${KERNEL_BRANCH} @ ${KERNEL_SHA:0:9}"
+            echo "  BakaSU:         ${KSU_SHA:0:8}"
+            echo "  SUSFS:          ${SUSFS_LINE}"
+            [ -n "$PREV_DATE" ] && echo "  Previous Build: ${PREV_DATE}"
+            echo ""
+            echo "  +-------------------------------------------+"
+            echo "  |  FLASH PRIORITY: ${PRIORITY}"
+            echo "  +-------------------------------------------+"
+            echo ""
+            echo "-- KERNEL SOURCE (${SINCE}) -----------"
+            echo "$K_SECTION"
+            echo ""
+            echo "-- BakaSU (${SINCE}) --------------"
+            echo "$B_SECTION"
+            echo ""
+            echo "-- SUSFS (${SINCE}) ---------------------"
+            if [ "$ENABLE_SUSFS" = "true" ]; then echo "$S_SECTION"; else echo "  Disabled for this build"; fi
+          } > CHANGELOG.txt
+
+          {
+            echo "## Upstream check"
+            echo ""
+            echo "| | Value |"
+            echo "|---|---|"
+            echo "| **Priority** | ${PRIORITY} |"
+            echo "| **Decision** | build = \`${SHOULD_BUILD}\` — ${REASON} |"
+            echo "| **SUSFS** | \`${ENABLE_SUSFS}\` |"
+            echo ""
+            echo '```'
+            cat CHANGELOG.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "should_build=${SHOULD_BUILD}"
+            echo "priority=${PRIORITY}"
+            echo "reason=${REASON}"
+            echo "kernel_sha=${KERNEL_SHA}"
+            echo "ksu_sha=${KSU_SHA}"
+            echo "susfs_sha=${SUSFS_SHA}"
+            echo "total_sec=${TOTAL_SEC}"
+            echo "total_fix=${TOTAL_FIX}"
+            echo "total_feat=${TOTAL_FEAT}"
+            echo "total_lts=${TOTAL_LTS}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload changelog for build job
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog
+          path: CHANGELOG.txt
+          retention-days: 3
+
+      - name: Discord notification (skipped)
+        if: steps.decide.outputs.should_build != 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          PRIORITY: ${{ steps.decide.outputs.priority }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "==> Discord webhook not configured — skipping notification."
+            exit 0
+          fi
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          PAYLOAD=$(jq -n \
+            --arg title "⏭️ SM8550 Kernel — build skipped" \
+            --arg desc "$REASON" \
+            --arg priority "$PRIORITY" \
+            --arg url "$RUN_URL" \
+            '{"embeds":[{"title":$title,"description":$desc,"color":9807270,
+              "fields":[
+                {"name":"Flash Priority","value":$priority,"inline":false},
+                {"name":"Check Log","value":("[View on GitHub](" + $url + ")"),"inline":false}],
+              "footer":{"text":"SM8550 Kernel CI • Upstream check"},
+              "timestamp":(now|strftime("%Y-%m-%dT%H:%M:%SZ"))}]}')
+          curl -sSf -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK_URL" \
+            && echo "==> Discord notification sent." \
+            || echo "WARNING: Discord notification failed (non-fatal)."
+
+  # ════════════════════════════════════════════════════════════════
+  #  STAGE 2 — Full build (only when the check says so)
+  # ════════════════════════════════════════════════════════════════
+  build:
+    name: Build BakaSU kernel
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    env:
+      KERNEL_SHA:     ${{ needs.check.outputs.kernel_sha }}
+      KSU_SHA:        ${{ needs.check.outputs.ksu_sha }}
+      SUSFS_SHA:      ${{ needs.check.outputs.susfs_sha }}
+      FLASH_PRIORITY: ${{ needs.check.outputs.priority }}
+      TOTAL_SEC:      ${{ needs.check.outputs.total_sec }}
+      TOTAL_FIX:      ${{ needs.check.outputs.total_fix }}
+      TOTAL_FEAT:     ${{ needs.check.outputs.total_feat }}
+      TOTAL_LTS:      ${{ needs.check.outputs.total_lts }}
+      CHANGELOG_PATH: CHANGELOG.txt
+
+    steps:
+      - name: Checkout kernel source (pinned)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.kernel_sha }}
           fetch-depth: 1
-          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: changelog
+          path: .
 
       - name: Install build dependencies
         run: |
@@ -132,279 +351,73 @@ jobs:
             g++-multilib gcc-multilib git gnupg \
             lib32readline-dev lib32z1-dev \
             libelf-dev liblz4-tool libssl-dev \
-            lzop zlib1g-dev pahole dwarves cpio zip \
+            lzop zlib1g-dev pahole dwarves cpio zip unzip \
             python3 python-is-python3 tar perl lz4 jq
 
-      - name: Restore Clang ${{ env.CLANG_VERSION }} from cache
+      # ── Clang (cached; downloaded only if the cache was evicted) ──
+      - name: Restore Clang from cache
+        id: cache-clang
         uses: actions/cache/restore@v4
         with:
           path: clang-toolchain
           key: clang-aosp-${{ env.CLANG_VERSION }}
-          fail-on-cache-miss: true
+
+      - name: Download Clang (cache miss only)
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL --retry 3 --connect-timeout 30 -o clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/mirror-goog-main-llvm-toolchain-source/clang-${CLANG_VERSION}.tar.gz" \
+            || { echo "::error::Clang download failed."; exit 1; }
+          mkdir -p clang-toolchain
+          tar -xf clang.tar.gz -C clang-toolchain
+          rm -f clang.tar.gz
+
+      - name: Save Clang to cache
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: clang-toolchain
+          key: clang-aosp-${{ env.CLANG_VERSION }}
 
       - name: Verify Clang
         run: |
           export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
           clang --version || { echo "ERROR: clang not found."; exit 1; }
 
-      - name: Setup ${{ matrix.display_name }}
-        id: ksu
+      # ── BakaSU (pinned to the SHA the check job saw) ──
+      - name: Set up BakaSU
         run: |
-          echo "==> Setting up ${{ matrix.display_name }}..."
-          curl -sSfL --retry 3 --connect-timeout 20 \
-            "${{ matrix.setup_url }}" \
-            | bash -s "${{ matrix.setup_arg }}" \
+          echo "==> Setting up BakaSU @ ${KSU_SHA}..."
+          curl -sSfL --retry 3 --connect-timeout 20 "$KSU_SETUP_URL" \
+            | bash -s "$KSU_SHA" \
             || { echo "ERROR: setup.sh failed."; exit 1; }
 
-          KSU_DIR="${{ matrix.ksu_dir }}"
-          KSU_TAG=$(git -C "${KSU_DIR}" describe --tags --abbrev=0 2>/dev/null \
-            || git -C "${KSU_DIR}" tag --list 'v[0-9]*' --sort=-v:refname \
-            2>/dev/null | head -1 \
-            || echo "main")
-
-          KPM_SUFFIX=""
-          if [ "${{ matrix.enable_kpm }}" = "true" ]; then
-            KPM_SUFFIX="-kpm"
+          ACTUAL="$(git -C KernelSU rev-parse HEAD)"
+          if [ "$ACTUAL" != "$KSU_SHA" ]; then
+            echo "==> setup.sh left ${ACTUAL}; checking out pinned SHA explicitly..."
+            git -C KernelSU fetch --quiet origin "$KSU_SHA" \
+              && git -C KernelSU checkout --quiet "$KSU_SHA" \
+              || { echo "::error::Could not check out BakaSU ${KSU_SHA}"; exit 1; }
           fi
+          [ "$(git -C KernelSU rev-parse HEAD)" = "$KSU_SHA" ] \
+            || { echo "::error::BakaSU pin verification failed"; exit 1; }
+          echo "  ✅ BakaSU @ $(git -C KernelSU rev-parse --short HEAD)"
 
-          HOOK_MODE="kprobes"
-          if [ "${{ matrix.use_manual_hook }}" = "true" ]; then
-            HOOK_MODE="manual-hook"
+          KSU_TAG=$(git -C KernelSU describe --tags --abbrev=0 2>/dev/null \
+            || git -C KernelSU tag --list 'v[0-9]*' --sort=-v:refname 2>/dev/null | head -1)
+          KSU_TAG="${KSU_TAG:-main}"
+
+          if [ "$ENABLE_SUSFS" = "true" ]; then
+            BUILD_SUFFIX="bakasu-${KSU_TAG}-susfs"
+          else
+            BUILD_SUFFIX="bakasu-${KSU_TAG}-nosusfs"
           fi
+          echo "KSUDIR=KernelSU"            >> "$GITHUB_ENV"
+          echo "KSU_TAG=${KSU_TAG}"         >> "$GITHUB_ENV"
+          echo "BUILDSUFFIX=${BUILD_SUFFIX}" >> "$GITHUB_ENV"
 
-          BUILD_SUFFIX="${{ matrix.artifact_prefix }}-${KSU_TAG}-${HOOK_MODE}${KPM_SUFFIX}"
-
-          echo "KSUDIR=${KSU_DIR}"           >> $GITHUB_ENV
-          echo "BUILDSUFFIX=${BUILD_SUFFIX}" >> $GITHUB_ENV
-
-      # ════════════════════════════════════════════════════════════
-      # ── Restore previous build SHAs for delta changelog ──
-      # ════════════════════════════════════════════════════════════
-      - name: Restore previous build SHAs
-        id: prev-build
-        uses: actions/cache/restore@v4
-        with:
-          path: .prev_build_shas
-          key: build-shas-${{ matrix.variant }}-
-          restore-keys: |
-            build-shas-${{ matrix.variant }}-
-
-      # ════════════════════════════════════════════════════════════
-      # ── Smart Build Changelog (delta-aware) ──
-      # ════════════════════════════════════════════════════════════
-      - name: Generate build changelog
+      - name: Dynamic header fixes
         run: |
-          echo "==> Generating smart build changelog..."
-          CHANGELOG="CHANGELOG.txt"
-
-          DATE=$(date '+%Y-%m-%d %H:%M UTC')
-          VARIANT="${{ matrix.display_name }}"
-          KSUDIR_LOCAL="${{ matrix.ksu_dir }}"
-
-          # ── Load previous build SHAs (safe parsing — no source) ──
-          PREV_KERNEL_SHA=""
-          PREV_KSU_SHA=""
-          PREV_SUSFS_SHA=""
-          PREV_DATE=""
-          if [ -f ".prev_build_shas" ]; then
-            PREV_KERNEL_SHA=$(grep '^PREV_KERNEL_SHA=' .prev_build_shas | cut -d= -f2- | tr -d "'")
-            PREV_KSU_SHA=$(grep '^PREV_KSU_SHA=' .prev_build_shas | cut -d= -f2- | tr -d "'")
-            PREV_SUSFS_SHA=$(grep '^PREV_SUSFS_SHA=' .prev_build_shas | cut -d= -f2- | tr -d "'")
-            PREV_DATE=$(grep '^PREV_DATE=' .prev_build_shas | cut -d= -f2- | tr -d "'")
-            echo "  Previous build found: ${PREV_DATE:-unknown}"
-            echo "  Previous kernel SHA: ${PREV_KERNEL_SHA:-unknown}"
-            echo "  Previous KSU SHA:    ${PREV_KSU_SHA:-unknown}"
-            echo "  Previous SUSFS SHA:  ${PREV_SUSFS_SHA:-unknown}"
-          else
-            echo "  No previous build found — showing last 15 commits"
-          fi
-
-          # ── Kernel source info ──
-          KERNEL_SHA=$(git rev-parse --short HEAD)
-          KERNEL_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "${{ env.KERNEL_BRANCH }}")
-
-          if [ -n "$PREV_KERNEL_SHA" ] && git cat-file -e "${PREV_KERNEL_SHA}^{commit}" 2>/dev/null; then
-            KERNEL_LOG=$(git log --oneline --date=short --format="%ad|%h|%s" "${PREV_KERNEL_SHA}..HEAD")
-            KERNEL_SINCE="since last build (${PREV_DATE})"
-          else
-            KERNEL_LOG=$(git log --oneline --date=short --format="%ad|%h|%s" -15)
-            KERNEL_SINCE="last 15 commits"
-          fi
-
-          # ── KSU info ──
-          KSU_TAG="unknown"
-          KSU_SHA="unknown"
-          KSU_LOG=""
-          KSU_SINCE="last 15 commits"
-          if [ -d "${KSUDIR_LOCAL}" ]; then
-            KSU_TAG=$(git -C "${KSUDIR_LOCAL}" describe --tags --abbrev=0 2>/dev/null \
-              || git -C "${KSUDIR_LOCAL}" tag --list 'v[0-9]*' --sort=-v:refname 2>/dev/null | head -1 \
-              || echo "main")
-            KSU_SHA=$(git -C "${KSUDIR_LOCAL}" rev-parse --short HEAD 2>/dev/null || echo "unknown")
-
-            if [ -n "$PREV_KSU_SHA" ] && git -C "${KSUDIR_LOCAL}" cat-file -e "${PREV_KSU_SHA}^{commit}" 2>/dev/null; then
-              KSU_LOG=$(git -C "${KSUDIR_LOCAL}" log --oneline --date=short --format="%ad|%h|%s" "${PREV_KSU_SHA}..HEAD" 2>/dev/null || echo "")
-              KSU_SINCE="since last build (${PREV_DATE})"
-            else
-              KSU_LOG=$(git -C "${KSUDIR_LOCAL}" log --oneline --date=short --format="%ad|%h|%s" -15 2>/dev/null || echo "")
-              KSU_SINCE="last 15 commits"
-            fi
-          fi
-
-          # ── Categorise commits function ──
-          categorise_commits() {
-            local LOG="$1"
-            local LABEL="$2"
-            local COUNTS_FILE="$3"
-
-            local SEC=0 FIX=0 FEAT=0 LTS=0 OTHER=0
-            local SEC_LINES="" FIX_LINES="" FEAT_LINES="" LTS_LINES="" OTHER_LINES=""
-
-            while IFS='|' read -r cdate chash cmsg; do
-              [ -z "$cmsg" ] && continue
-              cmsg_lower=$(echo "$cmsg" | tr '[:upper:]' '[:lower:]')
-
-              if echo "$cmsg_lower" | grep -qE 'security|cve-|vuln|overflow|use-after-free|oob|uaf|exploit|selinux fix'; then
-                SEC=$((SEC+1))
-                SEC_LINES="${SEC_LINES}    $(printf '\U0001F512') ${cdate}  ${chash}  ${cmsg}\n"
-              elif echo "$cmsg_lower" | grep -qE 'merge.*lts|merge.*5\.15\.|linux 5\.15\.|lts merge|upstream merge'; then
-                LTS=$((LTS+1))
-                LTS_LINES="${LTS_LINES}    $(printf '\U0001F504') ${cdate}  ${chash}  ${cmsg}\n"
-              elif echo "$cmsg_lower" | grep -qE 'fix|bug|crash|panic|null ptr|deadlock|race|hang|oops|regression|revert|resolve|repair'; then
-                FIX=$((FIX+1))
-                FIX_LINES="${FIX_LINES}    $(printf '\U0001F41B') ${cdate}  ${chash}  ${cmsg}\n"
-              elif echo "$cmsg_lower" | grep -qE 'feat|add|support|implement|introduce|enable|new|enhance|improv|optim'; then
-                FEAT=$((FEAT+1))
-                FEAT_LINES="${FEAT_LINES}    $(printf '\u2728') ${cdate}  ${chash}  ${cmsg}\n"
-              else
-                OTHER=$((OTHER+1))
-                OTHER_LINES="${OTHER_LINES}    $(printf '\U0001F527') ${cdate}  ${chash}  ${cmsg}\n"
-              fi
-            done <<< "$LOG"
-
-            echo "  ${LABEL}: ${SEC} security, ${FIX} bug fixes, ${FEAT} features, ${LTS} LTS merges, ${OTHER} other"
-            [ -n "$SEC_LINES" ]   && printf "  -- Security --\n${SEC_LINES}"
-            [ -n "$FIX_LINES" ]   && printf "  -- Bug Fixes --\n${FIX_LINES}"
-            [ -n "$FEAT_LINES" ]  && printf "  -- Features --\n${FEAT_LINES}"
-            [ -n "$LTS_LINES" ]   && printf "  -- LTS / Upstream Merges --\n${LTS_LINES}"
-            [ -n "$OTHER_LINES" ] && printf "  -- Other --\n${OTHER_LINES}"
-
-            echo "${SEC}:${FIX}:${FEAT}:${LTS}:${OTHER}" > "$COUNTS_FILE"
-          }
-
-          # ── Process kernel commits ──
-          KERNEL_RESULT=$(categorise_commits "$KERNEL_LOG" "Kernel" /tmp/kcounts)
-          read K_SEC K_FIX K_FEAT K_LTS K_OTHER <<< $(cat /tmp/kcounts | tr ':' ' ')
-
-          # ── Process KSU commits ──
-          KSU_RESULT=$(categorise_commits "$KSU_LOG" "$VARIANT" /tmp/ksucounts)
-          read KSU_SEC KSU_FIX KSU_FEAT KSU_LTS KSU_OTHER <<< $(cat /tmp/ksucounts | tr ':' ' ')
-
-          # ── Calculate flash priority ──
-          TOTAL_SEC=$((K_SEC + KSU_SEC))
-          TOTAL_FIX=$((K_FIX + KSU_FIX))
-          TOTAL_FEAT=$((K_FEAT + KSU_FEAT))
-
-          if [ "$TOTAL_SEC" -gt 0 ]; then
-            PRIORITY="FLASH NOW — Security patches detected"
-            PRIORITY_ICON="$(printf '\U0001F534')"
-          elif [ "$TOTAL_FIX" -gt 2 ] || [ "${K_LTS:-0}" -gt 0 ]; then
-            PRIORITY="RECOMMENDED — Bug fixes or LTS merge"
-            PRIORITY_ICON="$(printf '\U0001F7E1')"
-          elif [ "$TOTAL_FEAT" -gt 0 ] || [ "$TOTAL_FIX" -gt 0 ]; then
-            PRIORITY="OPTIONAL — Minor improvements"
-            PRIORITY_ICON="$(printf '\U0001F7E2')"
-          else
-            PRIORITY="SKIP — Maintenance only, no user-facing changes"
-            PRIORITY_ICON="$(printf '\u26AA')"
-          fi
-
-          PRIORITY_FULL="${PRIORITY_ICON} ${PRIORITY}"
-
-          # ── Write CHANGELOG.txt ──
-          {
-            echo "======================================================="
-            echo "  SM8550 KERNEL BUILD — CHANGE SUMMARY"
-            echo "======================================================="
-            echo ""
-            echo "  Build Date:     ${DATE}"
-            echo "  Variant:        ${VARIANT}"
-            echo "  Kernel:         ${KERNEL_BRANCH} @ ${KERNEL_SHA}"
-            echo "  KSU:            ${KSU_TAG} @ ${KSU_SHA}"
-            echo "  SUSFS:          ${{ env.SUSFS_BRANCH }} (see below)"
-            if [ -n "$PREV_DATE" ]; then
-              echo "  Previous Build: ${PREV_DATE}"
-            fi
-            echo ""
-            echo "  +-------------------------------------------+"
-            echo "  |  FLASH PRIORITY: ${PRIORITY_FULL}"
-            echo "  +-------------------------------------------+"
-            echo ""
-            echo "-- KERNEL SOURCE (${KERNEL_SINCE}) -----------"
-            echo "$KERNEL_RESULT"
-            echo ""
-            echo "-- ${VARIANT} (${KSU_SINCE}) --------------"
-            echo "$KSU_RESULT"
-            echo ""
-            echo "-- SUSFS ---------------------------------------"
-            echo "  (appended after SUSFS clone)"
-          } > "$CHANGELOG"
-
-          # ── GitHub Actions Job Summary ──
-          {
-            echo "## Build: ${VARIANT}"
-            echo ""
-            echo "| Component | Version | Commit |"
-            echo "|---|---|---|"
-            echo "| **Kernel** | \`${KERNEL_BRANCH}\` | \`${KERNEL_SHA}\` |"
-            echo "| **${VARIANT}** | \`${KSU_TAG}\` | \`${KSU_SHA}\` |"
-            echo "| **SUSFS** | \`${{ env.SUSFS_BRANCH }}\` | *(see below)* |"
-            if [ -n "$PREV_DATE" ]; then
-              echo ""
-              echo "> Comparing against previous build: **${PREV_DATE}**"
-            fi
-            echo ""
-            echo "### Flash Priority: ${PRIORITY_FULL}"
-            echo ""
-            echo "| Category | Kernel | KSU | Total |"
-            echo "|---|---|---|---|"
-            echo "| Security | ${K_SEC} | ${KSU_SEC} | ${TOTAL_SEC} |"
-            echo "| Bug Fixes | ${K_FIX} | ${KSU_FIX} | ${TOTAL_FIX} |"
-            echo "| Features | ${K_FEAT} | ${KSU_FEAT} | ${TOTAL_FEAT} |"
-            echo "| LTS Merges | ${K_LTS:-0} | - | ${K_LTS:-0} |"
-            echo ""
-            echo "<details><summary>Kernel Commits (${KERNEL_SINCE})</summary>"
-            echo ""
-            echo '```'
-            echo "$KERNEL_RESULT"
-            echo '```'
-            echo "</details>"
-            echo ""
-            echo "<details><summary>${VARIANT} Commits (${KSU_SINCE})</summary>"
-            echo ""
-            echo '```'
-            echo "$KSU_RESULT"
-            echo '```'
-            echo "</details>"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "CHANGELOG_PATH=${CHANGELOG}" >> $GITHUB_ENV
-          echo "FLASH_PRIORITY=${PRIORITY_FULL}" >> $GITHUB_ENV
-          echo "==> Changelog generated."
-
-      - name: KPM uapi headers + Dynamic Header Fixes
-        if: matrix.enable_kpm == 'true'
-        run: |
-          echo "==> Locating kpm.h..."
-          KPM_H_PATH=$(find "$KSUDIR" -name "kpm.h" | head -n 1)
-          if [ -n "$KPM_H_PATH" ]; then
-            echo "Found kpm.h at: $KPM_H_PATH"
-            mkdir -p include/uapi/
-            cp "$KPM_H_PATH" include/uapi/
-          else
-            echo "WARNING: kpm.h not found in $KSUDIR"
-          fi
-
           MAIN_MK="drivers/kernelsu/Makefile"
           if [ -f "${MAIN_MK}" ]; then
             if ! grep -q 'ccflags-y += -I$(srctree)/drivers/kernelsu' "${MAIN_MK}"; then
@@ -439,127 +452,103 @@ jobs:
             fi
           done
 
+      # ── SUSFS (pinned; skipped entirely when disabled) ──
       - name: Apply SUSFS patches
+        if: env.ENABLE_SUSFS == 'true'
         run: |
-          git clone --depth 1 \
-            "${{ env.SUSFS_REPO }}" \
-            -b "${{ env.SUSFS_BRANCH }}" \
-            susfs4ksu \
+          git clone --quiet -b "$SUSFS_BRANCH" "$SUSFS_REPO" susfs4ksu \
             || { echo "ERROR: SUSFS clone failed."; exit 1; }
+          git -C susfs4ksu checkout --quiet "$SUSFS_SHA" \
+            || { echo "ERROR: SUSFS commit ${SUSFS_SHA} not found."; exit 1; }
+          echo "==> SUSFS @ $(git -C susfs4ksu rev-parse --short HEAD)"
 
           cp susfs4ksu/kernel_patches/fs/susfs.c                fs/
           cp susfs4ksu/kernel_patches/include/linux/susfs.h     include/linux/
           cp susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
 
-          patch -p1 --forward \
-            < "susfs4ksu/kernel_patches/50_add_susfs_in_${{ env.SUSFS_BRANCH }}.patch" \
-            || { echo "ERROR: SUSFS kernel patch failed."; exit 1; }
+          SUSFS_PATCH="susfs4ksu/kernel_patches/50_add_susfs_in_${SUSFS_BRANCH}.patch"
 
-          KSU_PATCH="susfs4ksu/kernel_patches/10_enable_susfs_for_ksu.patch"
-          if [ -f "$KSU_PATCH" ]; then
-            echo "==> Attempting KSU driver SUSFS integration patch..."
-            if patch -p1 --forward --dry-run < "$KSU_PATCH" >/dev/null 2>&1; then
-              patch -p1 --forward < "$KSU_PATCH" \
-                || echo "WARNING: KSU driver patch apply failed (will inject Kconfig manually)."
-              echo "==> KSU driver SUSFS patch applied successfully."
-            else
-              echo "==> KSU driver patch already applied or conflicts — injecting Kconfig entries manually."
-            fi
+          if patch -p1 --forward --dry-run < "$SUSFS_PATCH" >/dev/null 2>&1; then
+            patch -p1 --forward < "$SUSFS_PATCH"
           else
-            echo "WARNING: $KSU_PATCH not found — will inject Kconfig entries manually."
+            echo "==> Strict apply failed; retrying with --fuzz=3..."
+            patch -p1 --forward --fuzz=3 < "$SUSFS_PATCH" || true
           fi
 
-          # ── Dynamic Kconfig injection ──
-          KSU_KCONFIG="drivers/kernelsu/Kconfig"
-          if [ -f "$KSU_KCONFIG" ]; then
-            if ! grep -q 'KSU_SUSFS' "$KSU_KCONFIG"; then
-              echo "==> SUSFS Kconfig entries missing — extracting from susfs headers..."
+          # ── Targeted port of fs/namespace.c hunk #1 (header block only) ──
+          if [ -f fs/namespace.c.rej ]; then
+            echo "==> Porting rejected fs/namespace.c header hunk manually..."
+            python3 - <<'PY'
+          import sys
+          p = "fs/namespace.c"
+          s = open(p).read()
 
-              printf '\nconfig KSU_SUSFS\n\tbool "Enable SUSFS for KernelSU"\n\tdepends on KSU\n\tdefault y\n\thelp\n\t  Patch for SUSFS on KernelSU\n' >> "$KSU_KCONFIG"
+          inc = ("#ifdef CONFIG_KSU_SUSFS\n"
+                 "#include <linux/susfs_def.h>\n"
+                 "#endif // #ifdef CONFIG_KSU_SUSFS\n\n")
+          blk = ("#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+                 "extern bool susfs_is_current_ksu_domain(void);\n"
+                 "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n\n"
+                 "#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */\n"
+                 "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\n")
 
-              SUSFS_OPTS=$(grep -hroE 'CONFIG_KSU_SUSFS_[A-Z_]+' susfs4ksu/kernel_patches/include/linux/susfs.h susfs4ksu/kernel_patches/fs/susfs.c 2>/dev/null | sort -u | sed 's/CONFIG_KSU_SUSFS_//')
+          inc_anchor = '#include "pnode.h"'
+          blk_anchor = "/* Maximum number of mounts in a mount namespace */"
 
-              echo "==> Found SUSFS sub-options: $SUSFS_OPTS"
-              for opt in $SUSFS_OPTS; do
-                DESC=$(echo "$opt" | tr '_' ' ' | tr '[:upper:]' '[:lower:]')
-                printf '\nconfig KSU_SUSFS_%s\n\tbool "Enable %s"\n\tdepends on KSU_SUSFS\n\tdefault y\n' "$opt" "$DESC" >> "$KSU_KCONFIG"
-              done
-              echo "==> SUSFS Kconfig entries injected dynamically."
-            else
-              echo "==> SUSFS Kconfig entries already present."
-            fi
-          else
-            echo "ERROR: KernelSU Kconfig not found at $KSU_KCONFIG"
+          if "linux/susfs_def.h" not in s:
+              if inc_anchor not in s:
+                  sys.exit("ERROR: anchor '#include \"pnode.h\"' not found in fs/namespace.c")
+              s = s.replace(inc_anchor, inc + inc_anchor, 1)
+
+          if "susfs_is_sdcard_android_data_not_decrypted;" not in s:
+              if blk_anchor not in s:
+                  sys.exit("ERROR: anchor 'Maximum number of mounts' not found in fs/namespace.c")
+              s = s.replace(blk_anchor, blk + blk_anchor, 1)
+
+          open(p, "w").write(s)
+          print("    fs/namespace.c header block inserted.")
+          PY
+            rm -f fs/namespace.c.rej fs/namespace.c.orig
+
+            grep -q 'linux/susfs_def.h' fs/namespace.c \
+              && grep -q 'CL_COPY_MNT_NS BIT(25)' fs/namespace.c \
+              || { echo "ERROR: fs/namespace.c manual port failed"; exit 1; }
+            echo "==> fs/namespace.c manual port verified."
+          fi
+
+          # ── Any OTHER rejects are still fatal ──
+          REJECTS="$(find . -name '*.rej' -not -path './out/*' -not -path './susfs4ksu/*')"
+          if [ -n "$REJECTS" ]; then
+            echo "ERROR: SUSFS hunks still rejected:"
+            for r in $REJECTS; do echo "--- $r ---"; cat "$r"; done
             exit 1
           fi
+          echo "==> SUSFS main patch applied with no rejects."
 
-          # ── Append SUSFS changelog (delta-aware, safe parsing) ──
-          SUSFS_SHA=$(git -C susfs4ksu rev-parse --short HEAD 2>/dev/null || echo "unknown")
-          SUSFS_LOG=""
-          SUSFS_SINCE="last 15 commits"
-
-          # Load previous SUSFS SHA safely
-          PREV_SUSFS_SHA=""
-          if [ -f ".prev_build_shas" ]; then
-            PREV_SUSFS_SHA=$(grep '^PREV_SUSFS_SHA=' .prev_build_shas | cut -d= -f2- | tr -d "'")
-          fi
-
-          if [ -n "$PREV_SUSFS_SHA" ] && git -C susfs4ksu cat-file -e "${PREV_SUSFS_SHA}^{commit}" 2>/dev/null; then
-            SUSFS_LOG=$(git -C susfs4ksu log --oneline --date=short --format="%ad|%h|%s" "${PREV_SUSFS_SHA}..HEAD" 2>/dev/null || echo "")
-            SUSFS_SINCE="since last build"
+          # ── Kconfig entries (only if BakaSU doesn't already ship them) ──
+          KSU_KCONFIG="drivers/kernelsu/Kconfig"
+          [ -f "$KSU_KCONFIG" ] || { echo "ERROR: KernelSU Kconfig not found at $KSU_KCONFIG"; exit 1; }
+          if ! grep -q 'KSU_SUSFS' "$KSU_KCONFIG"; then
+            echo "==> SUSFS Kconfig entries missing — extracting from susfs headers..."
+            printf '\nconfig KSU_SUSFS\n\tbool "Enable SUSFS for KernelSU"\n\tdepends on KSU\n\tdefault y\n\thelp\n\t  Patch for SUSFS on KernelSU\n' >> "$KSU_KCONFIG"
+            SUSFS_OPTS=$(grep -hroE 'CONFIG_KSU_SUSFS_[A-Z_]+' susfs4ksu/kernel_patches/include/linux/susfs.h susfs4ksu/kernel_patches/fs/susfs.c 2>/dev/null | sort -u | sed 's/CONFIG_KSU_SUSFS_//')
+            for opt in $SUSFS_OPTS; do
+              DESC=$(echo "$opt" | tr '_' ' ' | tr '[:upper:]' '[:lower:]')
+              printf '\nconfig KSU_SUSFS_%s\n\tbool "Enable %s"\n\tdepends on KSU_SUSFS\n\tdefault y\n' "$opt" "$DESC" >> "$KSU_KCONFIG"
+            done
+            echo "==> SUSFS Kconfig entries injected: $SUSFS_OPTS"
           else
-            SUSFS_LOG=$(git -C susfs4ksu log --oneline --date=short --format="%ad|%h|%s" -15 2>/dev/null || echo "")
+            echo "==> SUSFS Kconfig entries already present."
           fi
-
-          if [ -f "$CHANGELOG_PATH" ]; then
-            {
-              echo ""
-              echo "-- SUSFS (${SUSFS_SINCE}) ---------------------"
-              echo "  Branch: ${{ env.SUSFS_BRANCH }} @ ${SUSFS_SHA}"
-              while IFS='|' read -r cdate chash cmsg; do
-                [ -z "$cmsg" ] && continue
-                cmsg_lower=$(echo "$cmsg" | tr '[:upper:]' '[:lower:]')
-                if echo "$cmsg_lower" | grep -qE 'security|cve-|vuln'; then
-                  printf '    \U0001F512 %s  %s  %s\n' "$cdate" "$chash" "$cmsg"
-                elif echo "$cmsg_lower" | grep -qE 'fix|bug|crash'; then
-                  printf '    \U0001F41B %s  %s  %s\n' "$cdate" "$chash" "$cmsg"
-                elif echo "$cmsg_lower" | grep -qE 'feat|add|support|new|enhance'; then
-                  printf '    \u2728 %s  %s  %s\n' "$cdate" "$chash" "$cmsg"
-                else
-                  printf '    \U0001F527 %s  %s  %s\n' "$cdate" "$chash" "$cmsg"
-                fi
-              done <<< "$SUSFS_LOG"
-            } >> "$CHANGELOG_PATH"
-
-            # Update job summary
-            {
-              echo ""
-              echo "<details><summary>SUSFS Commits (${SUSFS_SINCE}) — \`${SUSFS_SHA}\`</summary>"
-              echo ""
-              echo '```'
-              echo "Branch: ${{ env.SUSFS_BRANCH }} @ ${SUSFS_SHA}"
-              while IFS='|' read -r cdate chash cmsg; do
-                [ -z "$cmsg" ] && continue
-                echo "  ${cdate}  ${chash}  ${cmsg}"
-              done <<< "$SUSFS_LOG"
-              echo '```'
-              echo "</details>"
-            } >> "$GITHUB_STEP_SUMMARY"
-
-            echo "==> SUSFS changelog appended."
-          fi
-
-          # Save current SUSFS SHA for next build
-          echo "CURRENT_SUSFS_SHA=${SUSFS_SHA}" >> $GITHUB_ENV
 
           rm -rf susfs4ksu
 
-      - name: Resolve kernel version and date
+      - name: Resolve kernel version
         id: meta
         run: |
           KVER=$(make kernelversion 2>/dev/null | awk -F. '{print $1"."$2"."$3}')
-          echo "kernelversion=${KVER}" >> $GITHUB_OUTPUT
-          echo "date=$(date +%Y%m%d)"  >> $GITHUB_OUTPUT
+          echo "kernelversion=${KVER}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date +%Y%m%d)"  >> "$GITHUB_OUTPUT"
 
       - name: Set up swap (24 GB)
         uses: pierotofy/set-swap-space@master
@@ -573,41 +562,47 @@ jobs:
             CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
             gki_defconfig
 
-      - name: Dynamically enable SUSFS + KPM configs
+      - name: Configure KSU, SUSFS and LTO
         run: |
           export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
-
-          # Always enable KSU base
           ./scripts/config --file out/.config -e CONFIG_KSU
 
-          # Dynamically enable ALL KSU_SUSFS options found in Kconfig
           KSU_KCONFIG="drivers/kernelsu/Kconfig"
-          echo "==> Dynamically enabling all SUSFS config options..."
-          grep -oE '^config KSU_SUSFS[A-Z_]*' "$KSU_KCONFIG" | while read -r line; do
-            OPT="CONFIG_${line#config }"
-            echo "  Enabling $OPT"
-            ./scripts/config --file out/.config -e "$OPT"
-          done
-
-          # Enable manual hook if this variant uses it
-          if [ "${{ matrix.use_manual_hook }}" = "true" ]; then
+          if [ "$ENABLE_SUSFS" = "true" ]; then
+            echo "==> Enabling all SUSFS config options..."
+            grep -oE '^config KSU_SUSFS[A-Z_]*' "$KSU_KCONFIG" | while read -r line; do
+              OPT="CONFIG_${line#config }"
+              echo "  Enabling $OPT"
+              ./scripts/config --file out/.config -e "$OPT"
+            done
+            # SUSFS on -> SUSFS inline hooks
             echo "==> Enabling manual hook mode..."
             ./scripts/config --file out/.config -e CONFIG_KSU_MANUAL_HOOK
+          else
+            echo "==> SUSFS disabled — turning off all KSU_SUSFS options..."
+            grep -oE '^config KSU_SUSFS[A-Z_]*' "$KSU_KCONFIG" 2>/dev/null | while read -r line; do
+              OPT="CONFIG_${line#config }"
+              echo "  Disabling $OPT"
+              ./scripts/config --file out/.config -d "$OPT"
+            done
+            ./scripts/config --file out/.config -d CONFIG_KSU_SUSFS
+            # SUSFS off -> BakaSU default (tracepoint) hook mode
+            echo "==> Using BakaSU default hook mode"
+            ./scripts/config --file out/.config -d CONFIG_KSU_MANUAL_HOOK
           fi
 
-          # Enable KPM if requested
-          if [ "${{ matrix.enable_kpm }}" = "true" ]; then
-            ./scripts/config --file out/.config \
-              -e CONFIG_KPM \
-              -e CONFIG_KALLSYMS \
-              -e CONFIG_KALLSYMS_ALL
-          fi
+          # ThinLTO: far lower memory than Full LTO (GitHub runners have 16 GB)
+          ./scripts/config --file out/.config -d CONFIG_LTO_NONE
+          ./scripts/config --file out/.config -e CONFIG_LTO
+          ./scripts/config --file out/.config -e CONFIG_LTO_CLANG
+          ./scripts/config --file out/.config -e CONFIG_LTO_CLANG_THIN
+          ./scripts/config --file out/.config -d CONFIG_LTO_CLANG_FULL
 
           make -j$(nproc --all) O=out ARCH=arm64 \
             CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
             olddefconfig
 
-      - name: Verify kernel config (dynamic)
+      - name: Verify kernel config
         run: |
           echo "==> Verifying kernel config options..."
           CONFIG="out/.config"
@@ -617,62 +612,46 @@ jobs:
           if grep -q 'CONFIG_KSU=y' "$CONFIG"; then
             echo "  ✅ CONFIG_KSU=y"
           else
-            echo "  ❌ CONFIG_KSU=y is MISSING!"
-            FAILED=1
+            echo "  ❌ CONFIG_KSU=y is MISSING!"; FAILED=1
           fi
 
-          if grep -q 'CONFIG_KSU_SUSFS=y' "$CONFIG"; then
-            echo "  ✅ CONFIG_KSU_SUSFS=y"
-          else
-            echo "  ❌ CONFIG_KSU_SUSFS=y is MISSING!"
-            FAILED=1
-          fi
-
-          echo "  --- SUSFS sub-options ---"
-          grep -oE '^config KSU_SUSFS_[A-Z_]+' "$KSU_KCONFIG" | while read -r line; do
-            OPT="CONFIG_${line#config }"
-            if grep -q "${OPT}=y" "$CONFIG"; then
-              echo "  ✅ ${OPT}=y"
+          if [ "$ENABLE_SUSFS" = "true" ]; then
+            if grep -q 'CONFIG_KSU_SUSFS=y' "$CONFIG"; then
+              echo "  ✅ CONFIG_KSU_SUSFS=y"
             else
-              echo "  ⚠️  ${OPT}=y not set (may have been dropped by olddefconfig)"
+              echo "  ❌ CONFIG_KSU_SUSFS=y is MISSING!"; FAILED=1
             fi
-          done
-
-          if [ "${{ matrix.enable_kpm }}" = "true" ]; then
-            echo "  --- KPM options ---"
-            for opt in CONFIG_KPM CONFIG_KALLSYMS CONFIG_KALLSYMS_ALL; do
-              if grep -q "${opt}=y" "$CONFIG"; then
-                echo "  ✅ ${opt}=y"
+            echo "  --- SUSFS sub-options ---"
+            grep -oE '^config KSU_SUSFS_[A-Z_]+' "$KSU_KCONFIG" | while read -r line; do
+              OPT="CONFIG_${line#config }"
+              if grep -q "${OPT}=y" "$CONFIG"; then
+                echo "  ✅ ${OPT}=y"
               else
-                echo "  ❌ ${opt}=y is MISSING!"
-                FAILED=1
+                echo "  ⚠️  ${OPT}=y not set (may have been dropped by olddefconfig)"
               fi
             done
-          fi
-
-          if [ "${{ matrix.use_manual_hook }}" = "true" ]; then
-            echo "  --- Hook mode ---"
-            if grep -q 'CONFIG_KSU_MANUAL_HOOK=y' "$CONFIG"; then
-              echo "  ✅ CONFIG_KSU_MANUAL_HOOK=y (inline hook mode)"
+          else
+            if grep -qE '^CONFIG_KSU_SUSFS(_[A-Z_]+)?=y' "$CONFIG"; then
+              echo "  ❌ SUSFS is disabled for this build but SUSFS options are still enabled:"
+              grep -E '^CONFIG_KSU_SUSFS(_[A-Z_]+)?=y' "$CONFIG"
+              FAILED=1
             else
-              echo "  ℹ️  CONFIG_KSU_MANUAL_HOOK not in .config (driver may handle hooks internally)"
+              echo "  ✅ SUSFS disabled (no CONFIG_KSU_SUSFS options set)"
             fi
           fi
 
+          echo "  --- LTO ---"
+          grep -q 'CONFIG_LTO_CLANG_THIN=y' "$CONFIG" && echo "  ✅ ThinLTO" || echo "  ⚠️  ThinLTO not set"
+
           if [ "$FAILED" -eq 1 ]; then
-            echo ""
             echo "::error::One or more CRITICAL config options are MISSING!"
-            echo "==> Dumping KSU/KPM config for debugging:"
-            grep -E 'CONFIG_KSU|CONFIG_KPM|CONFIG_KALLSYMS' "$CONFIG" || echo "(none found)"
+            grep -E 'CONFIG_KSU' "$CONFIG" || echo "(none found)"
             exit 1
           fi
-
-          echo ""
           echo "==> Config verification complete."
 
-      - name: Patch Header Refactors
+      - name: Apply fixes for missing KSU identifiers
         run: |
-          echo "==> Applying fixes for missing KSU identifiers..."
           sed -i '/#include <linux\/cred.h>/a \
           extern struct cred *ksu_cred;\
           extern bool allow_shell;\
@@ -682,33 +661,14 @@ jobs:
           extern bool ksu_late_loaded;' include/linux/sched.h
           echo "==> Headers patched successfully."
 
-      # ════════════════════════════════════════════════════════════
-      # ── KSU hook bridge stubs ──
-      #   Static keys conditionally included via shell check on
-      #   matrix.use_manual_hook at workflow runtime.
-      #   KSU-Next needs them, ReSukiSU defines them internally.
-      # ════════════════════════════════════════════════════════════
       - name: Create KSU hook bridge stubs
         run: |
-          echo "==> Creating bridge stubs for pre-baked KSU hooks..."
-
-          # Static keys only for KSU-Next — ReSukiSU defines them internally
-          STATIC_KEY_LINES=""
-          if [ "${{ matrix.use_manual_hook }}" != "true" ]; then
-            STATIC_KEY_LINES=$(printf '%s\n' \
-              'DEFINE_STATIC_KEY_FALSE(ksu_is_init_rc_hook_enabled);' \
-              'DEFINE_STATIC_KEY_FALSE(ksu_is_input_hook_enabled);')
-            echo "  Including static key stubs (KSU-Next variant)"
-          else
-            echo "  Skipping static key stubs (ReSukiSU defines them internally)"
-          fi
-
+          # Static keys are defined by BakaSU itself, so none are stubbed here.
           {
             echo '#include <linux/types.h>'
             echo '#include <linux/fs.h>'
             echo '#include <linux/version.h>'
             echo '#include <linux/jump_label.h>'
-            [ -n "$STATIC_KEY_LINES" ] && echo "$STATIC_KEY_LINES"
             echo 'int __attribute__((weak)) ksu_handle_sys_reboot(void) { return 0; }'
             echo 'int __attribute__((weak)) ksu_handle_sys_read(unsigned int fd, char __user *buf, size_t count) { return 0; }'
             echo 'int __attribute__((weak)) ksu_handle_vfs_fstat(int fd, struct kstat *stat) { return 0; }'
@@ -718,6 +678,7 @@ jobs:
             echo 'int __attribute__((weak)) ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags) { return 0; }'
             echo 'int __attribute__((weak)) ksu_handle_execveat_sucompat(int *fd, const char __user **filename_user, void *argv, void *envp, int *flags) { return 0; }'
             echo 'int __attribute__((weak)) ksu_init_rc_hook(const char *data, unsigned long count) { return 0; }'
+            echo 'int __attribute__((weak)) ksu_install_su_fd(void) { return 0; }'
             echo 'bool __attribute__((weak)) susfs_is_current_ksu_domain(void) { return true; }'
             echo 'unsigned int __attribute__((weak)) susfs_ksu_sid;'
             echo 'unsigned int __attribute__((weak)) susfs_priv_app_sid;'
@@ -729,109 +690,153 @@ jobs:
           echo "==> Bridge stubs created."
           grep 'ksu_hooks_bridge' kernel/Makefile || echo "WARNING: Entry not found!"
 
-      - name: Build kernel (${{ matrix.display_name }})
+      - name: Build kernel
         run: |
           export PATH="${GITHUB_WORKSPACE}/clang-toolchain/bin:${PATH}"
-          echo "==> Compiling: ${{ matrix.display_name }} [${BUILDSUFFIX}]..."
+          echo "==> Compiling [${BUILDSUFFIX}]..."
           make -j$(nproc --all) O=out ARCH=arm64 \
             CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1
 
-      - name: Verify SUSFS and KPM objects were compiled
+      - name: Post-build verification
         run: |
-          echo "==> Post-build verification..."
           FAILED=0
-
-          if find out/ -name "susfs.o" | grep -q .; then
-            echo "  ✅ fs/susfs.o found — SUSFS was compiled."
-          else
-            echo "  ❌ fs/susfs.o NOT found — SUSFS was NOT compiled!"
-            FAILED=1
-          fi
-
-          if [ "${{ matrix.enable_kpm }}" = "true" ]; then
-            if find out/ -path "*/kernelsu/kpm/*.o" | grep -q .; then
-              echo "  ✅ KPM objects found — KPM was compiled."
+          if [ "$ENABLE_SUSFS" = "true" ]; then
+            if find out/ -name "susfs.o" | grep -q .; then
+              echo "  ✅ fs/susfs.o found — SUSFS was compiled."
             else
-              echo "  ❌ KPM objects NOT found — KPM was NOT compiled!"
-              FAILED=1
+              echo "  ❌ fs/susfs.o NOT found — SUSFS was NOT compiled!"; FAILED=1
             fi
+          else
+            echo "  ℹ️  SUSFS disabled — skipping susfs.o check."
           fi
 
           if [ -f out/arch/arm64/boot/Image.gz ] || [ -f out/arch/arm64/boot/Image ]; then
             echo "  ✅ Kernel image found."
           else
-            echo "  ❌ Kernel image NOT found!"
-            FAILED=1
+            echo "  ❌ Kernel image NOT found!"; FAILED=1
           fi
 
-          if [ "$FAILED" -eq 1 ]; then
-            echo "::error::Post-build verification FAILED!"
-            exit 1
-          fi
+          [ "$FAILED" -eq 1 ] && { echo "::error::Post-build verification FAILED!"; exit 1; }
           echo "==> All post-build checks passed."
 
-      - name: Package AnyKernel3 ZIP
+      - name: Package AnyKernel3
         run: |
           cp .github/goodies/AnyKernel3.zip .
-          unzip AnyKernel3.zip -d AnyKernel3
+          unzip -q AnyKernel3.zip -d AnyKernel3
           if [ -f out/arch/arm64/boot/Image.gz ]; then
             cp out/arch/arm64/boot/Image.gz AnyKernel3/
           elif [ -f out/arch/arm64/boot/Image ]; then
             cp out/arch/arm64/boot/Image AnyKernel3/
           else
-            echo "ERROR: No kernel Image found"
-            exit 1
+            echo "ERROR: No kernel Image found"; exit 1
           fi
-
-          # Include changelog in the flashable ZIP
           if [ -f "$CHANGELOG_PATH" ]; then
             cp "$CHANGELOG_PATH" AnyKernel3/
             echo "==> CHANGELOG.txt included in AnyKernel3 package."
           fi
 
-      # ════════════════════════════════════════════════════════════
-      # ── Print changelog to build log ──
-      # ════════════════════════════════════════════════════════════
-      - name: Print build changelog
+      - name: Changelog summary
         run: |
-          echo ""
           echo "========================================================"
-          echo "              BUILD CHANGELOG SUMMARY"
+          [ -f "$CHANGELOG_PATH" ] && cat "$CHANGELOG_PATH" || echo "  (No changelog)"
           echo "========================================================"
-          echo ""
-          if [ -f "$CHANGELOG_PATH" ]; then
-            cat "$CHANGELOG_PATH"
-          else
-            echo "  (No changelog generated)"
-          fi
-          echo ""
-          echo "========================================================"
-          echo "  VERDICT: ${FLASH_PRIORITY}"
-          echo ""
-          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-susfs-${{ steps.meta.outputs.date }}"
+          echo "  VERDICT:  ${FLASH_PRIORITY}"
+          echo "  Artifact: sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX}-${{ steps.meta.outputs.date }}"
           echo "========================================================"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-susfs-${{ steps.meta.outputs.date }}
+          name: sm8550-${{ steps.meta.outputs.kernelversion }}-${{ env.BUILDSUFFIX }}-${{ steps.meta.outputs.date }}
           path: AnyKernel3
           compression-level: 9
-          if-no-files-found: warn
-          overwrite: false
+          if-no-files-found: error
 
-      # ════════════════════════════════════════════════════════════
-      # ── Save build SHAs for next run's delta changelog ──
-      #   Only saved on successful build so a failed build
-      #   doesn't corrupt the baseline.
-      # ════════════════════════════════════════════════════════════
-      - name: Save build SHAs for next run
+      - name: Discord notification
+        if: always()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "==> Discord webhook not configured — skipping notification."
+            exit 0
+          fi
+
+          if [ "${{ job.status }}" = "failure" ]; then
+            EMBED_COLOR=15548997; PRIORITY_LABEL="❌ BUILD FAILED — Check logs immediately"
+          elif echo "$FLASH_PRIORITY" | grep -q "FLASH NOW"; then
+            EMBED_COLOR=15548997; PRIORITY_LABEL="🔴 FLASH NOW — Security patches detected"
+          elif echo "$FLASH_PRIORITY" | grep -q "RECOMMENDED"; then
+            EMBED_COLOR=16776960; PRIORITY_LABEL="🟡 RECOMMENDED — Bug fixes or LTS merge"
+          elif echo "$FLASH_PRIORITY" | grep -q "OPTIONAL"; then
+            EMBED_COLOR=5763719;  PRIORITY_LABEL="🟢 OPTIONAL — Minor improvements"
+          else
+            EMBED_COLOR=9807270;  PRIORITY_LABEL="⚪ SKIP — Forced build, maintenance only"
+          fi
+
+          ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX:-unknown}-${{ steps.meta.outputs.date }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SUSFS_STATE="Disabled"; [ "$ENABLE_SUSFS" = "true" ] && SUSFS_STATE="Enabled (${SUSFS_SHA:0:7})"
+
+          PAYLOAD=$(jq -n \
+            --arg title "🔔 SM8550 Kernel Build — BakaSU ${KSU_TAG:-}" \
+            --arg desc "Automated build status notification." \
+            --arg priority "$PRIORITY_LABEL" \
+            --arg sec "🔒 Security: ${TOTAL_SEC:-0}" \
+            --arg fix "🐛 Bug Fixes: ${TOTAL_FIX:-0}" \
+            --arg feat "✨ Features: ${TOTAL_FEAT:-0}" \
+            --arg lts "🔄 LTS Merges: ${TOTAL_LTS:-0}" \
+            --arg susfs "$SUSFS_STATE" \
+            --arg artifact "$ARTIFACT" \
+            --arg url "$RUN_URL" \
+            --argjson color "$EMBED_COLOR" \
+            '{
+              "embeds": [{
+                "title": $title,
+                "description": $desc,
+                "color": $color,
+                "fields": [
+                  { "name": "Flash Priority", "value": $priority, "inline": false },
+                  { "name": "Security",       "value": $sec,      "inline": true  },
+                  { "name": "Bug Fixes",      "value": $fix,      "inline": true  },
+                  { "name": "Features",       "value": $feat,     "inline": true  },
+                  { "name": "LTS Merges",     "value": $lts,      "inline": true  },
+                  { "name": "SUSFS",          "value": $susfs,    "inline": true  },
+                  { "name": "Artifact",       "value": $artifact, "inline": false },
+                  { "name": "Build Log",      "value": ("[View on GitHub](" + $url + ")"), "inline": false }
+                ],
+                "footer": { "text": "SM8550 Kernel CI • Automated Build" },
+                "timestamp": (now | strftime("%Y-%m-%dT%H:%M:%SZ"))
+              }]
+            }')
+
+          curl -sSf -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK_URL" \
+            && echo "==> Discord notification sent." \
+            || echo "WARNING: Discord notification failed (non-fatal)."
+
+      # ── Advance the baseline only after a successful build ──
+      - name: Restore previous build SHAs
+        if: success()
+        uses: actions/cache/restore@v4
+        with:
+          path: .prev_build_shas
+          key: build-shas-resukisu-
+          restore-keys: build-shas-resukisu-
+
+      - name: Save build SHAs
         if: success()
         run: |
+          # Keep the old SUSFS baseline if SUSFS wasn't part of this build
+          if [ "$ENABLE_SUSFS" = "true" ]; then
+            SAVE_SUSFS="$SUSFS_SHA"
+          else
+            SAVE_SUSFS=""
+            [ -f .prev_build_shas ] && SAVE_SUSFS=$(grep '^PREV_SUSFS_SHA=' .prev_build_shas | cut -d= -f2- | tr -d "'" || true)
+          fi
           {
-            echo "PREV_KERNEL_SHA='$(git rev-parse HEAD)'"
-            echo "PREV_KSU_SHA='$(git -C "$KSUDIR" rev-parse HEAD 2>/dev/null || echo '')'"
-            echo "PREV_SUSFS_SHA='${CURRENT_SUSFS_SHA:-}'"
+            echo "PREV_KERNEL_SHA='${KERNEL_SHA}'"
+            echo "PREV_KSU_SHA='${KSU_SHA}'"
+            echo "PREV_SUSFS_SHA='${SAVE_SUSFS}'"
             echo "PREV_DATE='$(date '+%Y-%m-%d %H:%M UTC')'"
           } > .prev_build_shas
           echo "==> Build SHAs saved for next run:"
@@ -842,4 +847,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .prev_build_shas
-          key: build-shas-${{ matrix.variant }}-${{ github.run_id }}
+          key: build-shas-resukisu-${{ github.run_id }}
