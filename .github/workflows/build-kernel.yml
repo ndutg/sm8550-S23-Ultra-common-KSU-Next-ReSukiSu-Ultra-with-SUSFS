@@ -55,9 +55,8 @@ env:
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
   SUSFS_BRANCH: gki-android13-5.15
   BBG_REPO: https://github.com/vc-teahouse/Baseband-guard.git
-  BBG_SETUP_URL: https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh
   CLANG_VERSION: r584948
-  # Scheduled runs always use SUSFS and Baseband-guard; manual runs follow the tickboxes.
+  # Scheduled runs always use SUSFS; manual runs follow the tickbox.
   ENABLE_SUSFS: ${{ github.event_name == 'schedule' || inputs.enable_susfs }}
   ENABLE_BBG: ${{ github.event_name == 'schedule' || inputs.enable_bbg }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -134,10 +133,9 @@ jobs:
           KERNEL_SHA="$(git rev-parse HEAD)"
           KSU_SHA="$(git -C ksu-src rev-parse HEAD)"
           SUSFS_SHA="$(git -C susfs-src rev-parse HEAD)"
-          BBG_SHA="$(git -C bbg-src rev-parse HEAD)"
 
-          echo "==> Current : kernel ${KERNEL_SHA:0:12}  BakaSU ${KSU_SHA:0:12}  SUSFS ${SUSFS_SHA:0:12}  BBG ${BBG_SHA:0:12}"
-          echo "==> Previous: kernel ${PREV_KERNEL_SHA:0:12}  BakaSU ${PREV_KSU_SHA:0:12}  SUSFS ${PREV_SUSFS_SHA:0:12}  BBG ${PREV_BBG_SHA:0:12}  (${PREV_DATE:-none})"
+          echo "==> Current : kernel ${KERNEL_SHA:0:12}  BakaSU ${KSU_SHA:0:12}  SUSFS ${SUSFS_SHA:0:12}"
+          echo "==> Previous: kernel ${PREV_KERNEL_SHA:0:12}  BakaSU ${PREV_KSU_SHA:0:12}  SUSFS ${PREV_SUSFS_SHA:0:12}  (${PREV_DATE:-none})"
 
           BASELINE_OK=1
 
@@ -196,18 +194,21 @@ jobs:
           K_SECTION="$(categorise "Kernel" /tmp/kernel.log)"
           B_SECTION="$(categorise "BakaSU" /tmp/ksu.log)"
           S_SECTION="$(categorise "SUSFS" /tmp/susfs.log)"
+          G_SECTION="$(categorise "Baseband-guard" /tmp/bbg.log)"
 
           read -r K_SEC K_FIX K_FEAT K_LTS K_OTH < /tmp/kernel.log.counts
           read -r B_SEC B_FIX B_FEAT B_LTS B_OTH < /tmp/ksu.log.counts
           read -r S_SEC S_FIX S_FEAT S_LTS S_OTH < /tmp/susfs.log.counts
+          read -r G_SEC G_FIX G_FEAT G_LTS G_OTH < /tmp/bbg.log.counts
 
-          # SUSFS changes only matter when SUSFS is part of this build
+          # Optional component changes only matter when that component is enabled.
           if [ "$ENABLE_SUSFS" != "true" ]; then S_SEC=0; S_FIX=0; S_FEAT=0; S_LTS=0; fi
+          if [ "$ENABLE_BBG" != "true" ]; then G_SEC=0; G_FIX=0; G_FEAT=0; G_LTS=0; fi
 
-          TOTAL_SEC=$((K_SEC + B_SEC + S_SEC))
-          TOTAL_FIX=$((K_FIX + B_FIX + S_FIX))
-          TOTAL_FEAT=$((K_FEAT + B_FEAT + S_FEAT))
-          TOTAL_LTS=$((K_LTS + B_LTS + S_LTS))
+          TOTAL_SEC=$((K_SEC + B_SEC + S_SEC + G_SEC))
+          TOTAL_FIX=$((K_FIX + B_FIX + S_FIX + G_FIX))
+          TOTAL_FEAT=$((K_FEAT + B_FEAT + S_FEAT + G_FEAT))
+          TOTAL_LTS=$((K_LTS + B_LTS + S_LTS + G_LTS))
 
           if [ "$TOTAL_SEC" -gt 0 ]; then
             LEVEL="FLASH NOW";   PRIORITY="🔴 FLASH NOW — Security patches detected"
@@ -566,25 +567,17 @@ jobs:
 
           rm -rf susfs4ksu
 
-      # ── Baseband-guard: setup from upstream, but build the exact SHA
-      #    Stage 1 evaluated. This keeps changelog, decision and binary aligned. ──
       - name: Integrate Baseband-guard (pinned)
         if: env.ENABLE_BBG == 'true'
         run: |
           set -e
           echo "==> Integrating Baseband-guard @ ${BBG_SHA}..."
-
-          # Fetch setup.sh from the SAME audited commit, not moving main.
           BBG_SETUP="https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/${BBG_SHA}/setup.sh"
           curl -sSfL --retry 3 --connect-timeout 20 "$BBG_SETUP" | bash \
-            || { echo "::error::Baseband-guard setup.sh failed at ${BBG_SHA}"; exit 1; }
-
-          # The setup script integrates the source into the kernel tree. Verify
-          # the expected Kconfig option is now available before configuring it.
+            || { echo "::error::Baseband-guard setup failed at ${BBG_SHA}"; exit 1; }
           grep -rqs 'config BBG' security/Kconfig security/*/Kconfig 2>/dev/null \
             || { echo "::error::CONFIG_BBG not found after Baseband-guard integration"; exit 1; }
           echo "  ✅ Baseband-guard integrated from audited SHA ${BBG_SHA:0:8}"
-
           echo "BUILDSUFFIX=${BUILDSUFFIX}-bbg" >> "$GITHUB_ENV"
 
       - name: Resolve kernel version
@@ -635,6 +628,17 @@ jobs:
             ./scripts/config --file out/.config -d CONFIG_KSU_MANUAL_HOOK
           fi
 
+          if [ "$ENABLE_BBG" = "true" ]; then
+            echo "==> Enabling Baseband-guard..."
+            ./scripts/config --file out/.config -e CONFIG_BBG
+            CUR_LSM="$(grep '^CONFIG_LSM=' out/.config | cut -d'"' -f2)"
+            [ -n "$CUR_LSM" ] || { echo "::error::CONFIG_LSM not found"; exit 1; }
+            case ",${CUR_LSM}," in
+              *,baseband_guard,*) NEW_LSM="$CUR_LSM" ;;
+              *) NEW_LSM="${CUR_LSM},baseband_guard" ;;
+            esac
+            ./scripts/config --file out/.config --set-str CONFIG_LSM "$NEW_LSM"
+          fi
           # ThinLTO: far lower memory than Full LTO (GitHub runners have 16 GB)
           ./scripts/config --file out/.config -d CONFIG_LTO_NONE
           ./scripts/config --file out/.config -e CONFIG_LTO
@@ -684,12 +688,19 @@ jobs:
             fi
           fi
 
+          echo "  --- Baseband-guard ---"
+          if [ "$ENABLE_BBG" = "true" ]; then
+            grep -q '^CONFIG_BBG=y' "$CONFIG" && echo "  ✅ CONFIG_BBG=y" || { echo "  ❌ CONFIG_BBG missing"; FAILED=1; }
+            grep '^CONFIG_LSM=' "$CONFIG" | grep -q 'baseband_guard' && echo "  ✅ baseband_guard in CONFIG_LSM" || { echo "  ❌ baseband_guard not in CONFIG_LSM"; FAILED=1; }
+          else
+            echo "  ℹ️  Baseband-guard disabled"
+          fi
           echo "  --- LTO ---"
           grep -q 'CONFIG_LTO_CLANG_THIN=y' "$CONFIG" && echo "  ✅ ThinLTO" || echo "  ⚠️  ThinLTO not set"
 
           if [ "$FAILED" -eq 1 ]; then
             echo "::error::One or more CRITICAL config options are MISSING!"
-            grep -E 'CONFIG_KSU|CONFIG_BBG|CONFIG_LSM=' "$CONFIG" || echo "(none found)"
+            grep -E 'CONFIG_KSU' "$CONFIG" || echo "(none found)"
             exit 1
           fi
           echo "==> Config verification complete."
@@ -754,6 +765,11 @@ jobs:
             echo "  ℹ️  SUSFS disabled — skipping susfs.o check."
           fi
 
+          if [ "$ENABLE_BBG" = "true" ]; then
+            BBG_OBJ="$(find out/security -type f -name '*.o' 2>/dev/null | grep -iE 'baseband|bbg' | head -5 || true)"
+            [ -n "$BBG_OBJ" ] && { echo "  ✅ Baseband-guard object(s) found:"; echo "$BBG_OBJ" | sed 's/^/       /'; } \
+              || { echo "  ❌ Baseband-guard object not found"; FAILED=1; }
+          fi
           if [ -f out/arch/arm64/boot/Image.gz ] || [ -f out/arch/arm64/boot/Image ]; then
             echo "  ✅ Kernel image found."
           else
@@ -821,6 +837,7 @@ jobs:
           ARTIFACT="sm8550-${{ steps.meta.outputs.kernelversion }}-${BUILDSUFFIX:-unknown}-${{ steps.meta.outputs.date }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           SUSFS_STATE="Disabled"; [ "$ENABLE_SUSFS" = "true" ] && SUSFS_STATE="Enabled (${SUSFS_SHA:0:7})"
+          BBG_STATE="Disabled"; [ "$ENABLE_BBG" = "true" ] && BBG_STATE="Enabled (${BBG_SHA:0:7})"
 
           PAYLOAD=$(jq -n \
             --arg title "🔔 SM8550 Kernel Build — BakaSU ${KSU_TAG:-}" \
@@ -879,7 +896,6 @@ jobs:
             SAVE_SUSFS=""
             [ -f .prev_build_shas ] && SAVE_SUSFS=$(grep '^PREV_SUSFS_SHA=' .prev_build_shas | cut -d= -f2- | tr -d "'" || true)
           fi
-          # Keep old BBG baseline if BBG wasn't part of this build.
           if [ "$ENABLE_BBG" = "true" ]; then
             SAVE_BBG="$BBG_SHA"
           else
