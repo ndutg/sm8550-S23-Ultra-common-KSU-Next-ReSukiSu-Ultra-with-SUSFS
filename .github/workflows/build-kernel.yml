@@ -133,9 +133,10 @@ jobs:
           KERNEL_SHA="$(git rev-parse HEAD)"
           KSU_SHA="$(git -C ksu-src rev-parse HEAD)"
           SUSFS_SHA="$(git -C susfs-src rev-parse HEAD)"
+          BBG_SHA="$(git -C bbg-src rev-parse HEAD)"
 
-          echo "==> Current : kernel ${KERNEL_SHA:0:12}  BakaSU ${KSU_SHA:0:12}  SUSFS ${SUSFS_SHA:0:12}"
-          echo "==> Previous: kernel ${PREV_KERNEL_SHA:0:12}  BakaSU ${PREV_KSU_SHA:0:12}  SUSFS ${PREV_SUSFS_SHA:0:12}  (${PREV_DATE:-none})"
+          echo "==> Current : kernel ${KERNEL_SHA:0:12}  BakaSU ${KSU_SHA:0:12}  SUSFS ${SUSFS_SHA:0:12}  BBG ${BBG_SHA:0:12}"
+          echo "==> Previous: kernel ${PREV_KERNEL_SHA:0:12}  BakaSU ${PREV_KSU_SHA:0:12}  SUSFS ${PREV_SUSFS_SHA:0:12}  BBG ${PREV_BBG_SHA:0:12}  (${PREV_DATE:-none})"
 
           BASELINE_OK=1
 
