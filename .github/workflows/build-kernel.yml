@@ -38,7 +38,7 @@ on:
       enable_hardening:
         description: "Extra kernel hardening (stack offset randomisation, wipe-on-free, SYN cookies)"
         type: boolean
-        default: false
+        default: true
       force_build:
         description: "Build even if the priority is SKIP"
         type: boolean
@@ -65,7 +65,7 @@ env:
   ENABLE_BBG: ${{ github.event_name == 'schedule' || inputs.enable_bbg }}
   # Manual-only until tested on device. To include in daily builds, change to:
   #   ${{ github.event_name == 'schedule' || inputs.enable_hardening }}
-  ENABLE_HARDENING: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_hardening }}
+  ENABLE_HARDENING: ${{ github.event_name == 'schedule' || inputs.enable_hardening }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
