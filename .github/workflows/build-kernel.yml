@@ -35,6 +35,10 @@ on:
         description: "Build with Baseband-guard (scheduled builds always enable it)"
         type: boolean
         default: true
+      enable_hardening:
+        description: "Extra kernel hardening (stack offset randomisation, wipe-on-free, SYN cookies)"
+        type: boolean
+        default: false
       force_build:
         description: "Build even if the priority is SKIP"
         type: boolean
@@ -59,6 +63,9 @@ env:
   # Scheduled runs always use SUSFS; manual runs follow the tickbox.
   ENABLE_SUSFS: ${{ github.event_name == 'schedule' || inputs.enable_susfs }}
   ENABLE_BBG: ${{ github.event_name == 'schedule' || inputs.enable_bbg }}
+  # Manual-only until tested on device. To include in daily builds, change to:
+  #   ${{ github.event_name == 'schedule' || inputs.enable_hardening }}
+  ENABLE_HARDENING: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_hardening }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
@@ -581,6 +588,10 @@ jobs:
           echo "  ✅ Baseband-guard integrated from audited SHA ${BBG_SHA:0:8}"
           echo "BUILDSUFFIX=${BUILDSUFFIX}-bbg" >> "$GITHUB_ENV"
 
+      - name: Tag hardened build
+        if: env.ENABLE_HARDENING == 'true'
+        run: echo "BUILDSUFFIX=${BUILDSUFFIX}-hardened" >> "$GITHUB_ENV"
+
       - name: Resolve kernel version
         id: meta
         run: |
@@ -640,6 +651,14 @@ jobs:
             esac
             ./scripts/config --file out/.config --set-str CONFIG_LSM "$NEW_LSM"
           fi
+          if [ "$ENABLE_HARDENING" = "true" ]; then
+            echo "==> Enabling extra hardening..."
+            ./scripts/config --file out/.config -e CONFIG_RANDOMIZE_KSTACK_OFFSET
+            ./scripts/config --file out/.config -e CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT
+            ./scripts/config --file out/.config -e CONFIG_INIT_ON_FREE_DEFAULT_ON
+            ./scripts/config --file out/.config -e CONFIG_SYN_COOKIES
+          fi
+
           # ThinLTO: far lower memory than Full LTO (GitHub runners have 16 GB)
           ./scripts/config --file out/.config -d CONFIG_LTO_NONE
           ./scripts/config --file out/.config -e CONFIG_LTO
@@ -696,6 +715,39 @@ jobs:
           else
             echo "  ℹ️  Baseband-guard disabled"
           fi
+          echo "  --- Extra hardening ---"
+          if [ "$ENABLE_HARDENING" = "true" ]; then
+            for OPT in CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT CONFIG_INIT_ON_FREE_DEFAULT_ON CONFIG_SYN_COOKIES; do
+              if grep -q "^${OPT}=y" "$CONFIG"; then
+                echo "  ✅ ${OPT}=y"
+              else
+                echo "  ❌ ${OPT} was dropped by olddefconfig"; FAILED=1
+              fi
+            done
+          else
+            echo "  ℹ️  Extra hardening disabled"
+          fi
+
+          # Read-only audit: shows the state of common security options.
+          # Never fails the build.
+          echo "  --- Security audit (read-only) ---"
+          for OPT in CFI_CLANG SHADOW_CALL_STACK STACKPROTECTOR_STRONG \
+                     HARDENED_USERCOPY FORTIFY_SOURCE STRICT_KERNEL_RWX \
+                     SLAB_FREELIST_HARDENED SLAB_FREELIST_RANDOM SHUFFLE_PAGE_ALLOCATOR \
+                     INIT_STACK_ALL_ZERO INIT_ON_ALLOC_DEFAULT_ON INIT_ON_FREE_DEFAULT_ON \
+                     RANDOMIZE_BASE RANDOMIZE_KSTACK_OFFSET_DEFAULT KFENCE \
+                     BUG_ON_DATA_CORRUPTION DEBUG_LIST SECURITY_DMESG_RESTRICT \
+                     STATIC_USERMODEHELPER SYN_COOKIES ARM64_PTR_AUTH ARM64_BTI_KERNEL \
+                     ARM64_MTE SECURITY_LOCKDOWN_LSM MODULE_SIG_FORCE; do
+            VAL="$(grep -E "^CONFIG_${OPT}=" "$CONFIG" | cut -d= -f2)"
+            if [ -n "$VAL" ]; then
+              printf '    %-34s %s\n' "$OPT" "$VAL"
+            else
+              printf '    %-34s %s\n' "$OPT" "not set"
+            fi
+          done
+          printf '    %-34s %s\n' "LSM" "$(grep '^CONFIG_LSM=' "$CONFIG" | cut -d= -f2)"
+
           echo "  --- LTO ---"
           grep -q 'CONFIG_LTO_CLANG_THIN=y' "$CONFIG" && echo "  ✅ ThinLTO" || echo "  ⚠️  ThinLTO not set"
 
@@ -839,6 +891,7 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           SUSFS_STATE="Disabled"; [ "$ENABLE_SUSFS" = "true" ] && SUSFS_STATE="Enabled (${SUSFS_SHA:0:7})"
           BBG_STATE="Disabled"; [ "$ENABLE_BBG" = "true" ] && BBG_STATE="Enabled (${BBG_SHA:0:7})"
+          HARD_STATE="Disabled"; [ "$ENABLE_HARDENING" = "true" ] && HARD_STATE="Enabled"
 
           PAYLOAD=$(jq -n \
             --arg title "🔔 SM8550 Kernel Build — BakaSU ${KSU_TAG:-}" \
@@ -850,6 +903,7 @@ jobs:
             --arg lts "🔄 LTS Merges: ${TOTAL_LTS:-0}" \
             --arg susfs "$SUSFS_STATE" \
             --arg bbg "$BBG_STATE" \
+            --arg hard "$HARD_STATE" \
             --arg artifact "$ARTIFACT" \
             --arg url "$RUN_URL" \
             --argjson color "$EMBED_COLOR" \
@@ -866,6 +920,7 @@ jobs:
                   { "name": "LTS Merges",     "value": $lts,      "inline": true  },
                   { "name": "SUSFS",          "value": $susfs,    "inline": true  },
                   { "name": "Baseband-guard", "value": $bbg,      "inline": true  },
+                  { "name": "Hardening",      "value": $hard,     "inline": true  },
                   { "name": "Artifact",       "value": $artifact, "inline": false },
                   { "name": "Build Log",      "value": ("[View on GitHub](" + $url + ")"), "inline": false }
                 ],
